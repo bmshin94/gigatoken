@@ -1,42 +1,23 @@
-//! Open-addressing cache for short (≤ 15 byte) pretoken encodings. Three
-//! properties of the encode loop drive the design (measured on 1 GB OWT,
-//! Zen 2):
+//! Open-addressing cache for short (≤ 15 byte) pretoken encodings. The
+//! table far exceeds L2/L3, so a probe in the Zipf tail is a DRAM access:
 //!
-//! - The table holds ~1.3M unique pretokens (~99.4% hit rate), far beyond
-//!   L2/L3, so a lookup in the Zipf tail is a random DRAM access. hashbrown
-//!   spends two cache lines per probe (control bytes + entry); this table's
-//!   32-byte entries are self-contained and bucketed into line-aligned
-//!   pairs, so a probe touches exactly one line, and the two prefetch
-//!   flavors let the encode loop stage that line ([`Self::prefetch_l2`] a
-//!   chunk ahead, [`Self::prefetch`] a few probes ahead) instead of
-//!   stalling on it.
-//! - 228M output tokens / 208M pretokens: ~90% of pretokens encode to ONE
-//!   token and ~98% to at most two. The value is a packed `u64` plus an
-//!   extension word (see `tiktoken::pack_val_inline`) holding up to four
-//!   tokens inline — one dependent load, and no second random access into
-//!   the token arena.
-//! - At ~64 MB the table also blows the dTLB through 4 KiB pages, so the
-//!   backing memory is 2 MiB-aligned and `MADV_HUGEPAGE`d — with THP
-//!   available the whole table sits in a few dozen dTLB entries. (Note:
-//!   processes launched under `PR_SET_THP_DISABLE` — some sandboxes and
-//!   session managers do this — silently get 4 KiB pages anyway.)
+//! - 32-byte self-contained entries in line-aligned pairs, so a probe
+//!   touches exactly one line, staged by [`Self::prefetch_l2`] a chunk
+//!   ahead and [`ProbeView::prefetch`] a few probes ahead.
+//! - Values hold up to four tokens inline (`tiktoken::pack_val_inline`),
+//!   covering ~98% of pretokens with no second access into the arena.
+//! - Backing memory is 2 MiB-aligned and `MADV_HUGEPAGE`d against dTLB misses.
 //!
-//! Linear probing over aligned pairs: a bucket is slots `idx` and `idx + 1`
-//! with `idx` even, so both share one 64 B line, and [`Self::probe_pair`]
-//! resolves the overwhelmingly common displacement-0/1 hit branch-free from
-//! that single line. Inserts fill the first empty slot of the walk; growth
-//! doubles at 3/4 load. Key 0 marks empty slots: a real key always has its
-//! nonzero length in the top byte (`pack_pretoken_key` tags length; empty
-//! pretokens pack to key 0, which the encode loop routes to the long map,
-//! never here).
+//! Linear probing over aligned pairs (`idx` even, `idx + 1` on the same
+//! line); inserts fill the first empty slot of the walk; growth doubles at
+//! 3/4 load. Key 0 marks empty slots (real keys carry a nonzero length in
+//! the top byte; empty pretokens route to the long map, never here).
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::ptr::NonNull;
 
-/// One slot: the packed pretoken key plus its packed encoding — `val`
-/// (count, spill flag, tokens 1-2) and `ext` (tokens 3-4, see
-/// `tiktoken::pack_val_inline`). Exactly 32 bytes: two slots per cache
-/// line, never straddling one.
+/// One slot: the packed pretoken key plus its packed encoding (`val`,
+/// `ext`; see `tiktoken::pack_val_inline`). Exactly 32 bytes.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Entry {
@@ -49,10 +30,9 @@ const _: () = assert!(std::mem::size_of::<Entry>() == 32);
 
 const EMPTY_KEY: u128 = 0;
 
-/// The table's slot array: a manually managed, zeroed (== all-empty,
-/// since `EMPTY_KEY` is 0), 2 MiB-aligned allocation marked
-/// `MADV_HUGEPAGE`. A plain `Box<[Entry]>` can neither over-align nor
-/// keep dealloc's layout in sync with an over-aligned alloc.
+/// The table's slot array: a manually managed, zeroed (== all-empty),
+/// 2 MiB-aligned allocation marked `MADV_HUGEPAGE` (a `Box<[Entry]>`
+/// cannot over-align).
 struct Slots {
     ptr: NonNull<Entry>,
     cap: usize,
@@ -68,15 +48,8 @@ impl Slots {
         let Some(ptr) = NonNull::new(raw as *mut Entry) else {
             handle_alloc_error(layout)
         };
-        // Hint huge pages BEFORE first touch. `alloc_zeroed` on a 2 MiB-
-        // aligned layout is aligned_alloc + an explicit memset that faults
-        // the whole fresh mapping in as 4 KiB pages, after which the hint
-        // is a no-op for this run (khugepaged collapses far too slowly to
-        // matter): the table then walks the dTLB on every probe, and Zen
-        // drops software prefetches that miss the dTLB — measured +15%
-        // cold / +7% warm encode from this ordering alone (see
-        // profiling/zen5_st_profile.md §3). Madvised first, the zeroing
-        // write below faults it in as 2 MiB pages.
+        // madvise BEFORE the zeroing write, or the table faults in as
+        // 4 KiB pages (measured: +15% cold encode from this order alone).
         super::madvise_hugepage(raw, layout.size());
         // SAFETY: raw is a live allocation of exactly layout.size() bytes.
         unsafe { std::ptr::write_bytes(raw, 0, layout.size()) };
@@ -86,8 +59,7 @@ impl Slots {
     fn layout(cap: usize) -> Layout {
         let size = cap * std::mem::size_of::<Entry>();
         // Huge-page alignment only once the table outgrows one huge page;
-        // small tables (fresh tokenizers encoding little text) stay modest.
-        // Floor of 64 so an even-indexed pair always shares one cache line.
+        // floor of 64 so an even-indexed pair always shares one cache line.
         let align = Self::HUGE_PAGE.min(size.next_power_of_two()).max(64);
         Layout::from_size_align(size, align).expect("table layout overflow")
     }
@@ -118,9 +90,8 @@ impl Drop for Slots {
 unsafe impl Send for Slots {}
 unsafe impl Sync for Slots {}
 
-/// Request the line holding `p` into L1 (`L1 = true`) or L2 only — the
-/// shared ladder behind [`ShortPretokenCache::prefetch_l2`] and
-/// [`ProbeView::prefetch`]. No-op on arches without a prefetch hint.
+/// Request the line holding `p` into L1 (`L1 = true`) or L2 only. No-op
+/// on arches without a prefetch hint.
 #[inline(always)]
 fn prefetch_line<const L1: bool>(p: *const Entry) {
     #[cfg(target_arch = "x86_64")]
@@ -167,16 +138,9 @@ impl ShortPretokenCache {
         Self { slots: Slots::new_zeroed(cap), mask: cap - 1, len: 0 }
     }
 
-    /// A table sized to hold at least `n` entries without growing (same
-    /// 3/4-load threshold as [`Self::insert`], with a 2^16-slot
-    /// floor), starting from at least `min_slots` slots. The
-    /// vocab-seeding path inserts ~50k entries up front; sizing for them
-    /// avoids rehashing mid-seed. `min_slots` lets a parallel worker start
-    /// at the final capacity expected for its share of the input (see
-    /// `Tokenizer::fork_sized`), skipping the doubling-rehash churn of a
-    /// cold run — a starting point only, the table still grows past it at
-    /// 3/4 load. Either way the table is constructed exactly once, at the
-    /// max of the two requirements.
+    /// A table holding at least `n` entries without growing (3/4 load,
+    /// 2^16-slot floor), starting from at least `min_slots` slots (a
+    /// worker's workload estimate; the table still grows past it).
     pub(crate) fn with_at_least(n: usize, min_slots: usize) -> Self {
         Self::with_pow2_capacity(Self::required_capacity(n, min_slots))
     }
@@ -191,9 +155,8 @@ impl ShortPretokenCache {
         cap
     }
 
-    /// Zero every slot in place (all-zero == all-empty), keeping the
-    /// allocation — the generational-wipe path. Like [`Self::insert`]'s
-    /// grow, this logically invalidates any outstanding [`ProbeView`].
+    /// Zero every slot in place, keeping the allocation. Invalidates any
+    /// outstanding [`ProbeView`].
     pub(crate) fn clear(&mut self) {
         // SAFETY: the allocation holds exactly `cap` entries.
         unsafe { std::ptr::write_bytes(self.slots.ptr.as_ptr(), 0, self.slots.cap) };
@@ -223,35 +186,23 @@ impl ShortPretokenCache {
         unsafe { self.slots.ptr.as_ptr().add((h as usize) & self.mask & !1) }
     }
 
-    /// Request the probe's cache line into L2 only. The encode loop calls
-    /// this a full chunk (hundreds of cycles) before the probe — enough to
-    /// cover DRAM — without evicting the span walker's L1 working set the
-    /// way a chunk's worth of L1 prefetches would.
+    /// Request the probe's cache line into L2 only: issued a full chunk
+    /// before the probe (covers DRAM) without evicting the walker's L1 set.
     #[inline(always)]
     pub(crate) fn prefetch_l2(&self, h: u64) {
         prefetch_line::<false>(self.pair_ptr(h));
     }
 
-    /// A raw, `Copy` snapshot of the probe parameters for the emit loop's
-    /// hot path. Holding one across a chunk keeps the table base and mask
-    /// in registers instead of being reloaded from `self` every iteration
-    /// (the slow path's `&mut self` calls otherwise force the reload).
-    /// Invalidated by [`Self::insert`] (which may grow the table): callers
-    /// must take a fresh view after any insert.
+    /// A raw, `Copy` snapshot of the probe parameters, so the emit loop
+    /// keeps table base and mask in registers. Invalidated by any insert
+    /// (which may grow the table): take a fresh view after one.
     pub(crate) fn probe_view(&self) -> ProbeView {
         ProbeView { base: self.slots.ptr.as_ptr(), pair_mask: self.mask & !1 }
     }
 
-    /// Look up `key`, walking pairs from its home bucket. Inserts fill the
-    /// first empty slot of the walk, so any pair holding an empty slot
-    /// terminates it. A miss (`Err`) also reports where the key belongs —
-    /// the first empty slot of the walk, which is exactly what
-    /// [`Self::first_empty`] would find (every pair before the
-    /// terminating one was full), discovered by loads the lookup performs
-    /// anyway. [`Self::insert_at`] then skips re-walking the chain. The
-    /// slot stays valid until the next insert or grow: lookups never
-    /// mutate, and the encode miss path computes the entry's value
-    /// without touching the table.
+    /// Look up `key`, walking pairs from its home bucket. A miss (`Err`)
+    /// reports the first empty slot of the walk — where [`Self::insert_at`]
+    /// places the key, valid until the next insert or grow.
     pub(crate) fn get_or_slot(&self, key: u128, h: u64) -> Result<(u64, u64), usize> {
         debug_assert_ne!(key, EMPTY_KEY);
         let mut idx = (h as usize) & self.mask & !1;
@@ -322,12 +273,8 @@ impl ShortPretokenCache {
         self.len += 1;
     }
 
-    /// Insert `key`, overwriting its value if the key is already present
-    /// (the plain [`Self::insert`] assumes absence). Cold loader-phase
-    /// entry point for the vocab-seed sync (`set_added_tokens`' overwrite
-    /// and restore loops and `fork_sized`'s added-token re-apply), where
-    /// an added token's content can duplicate an already-seeded vocab
-    /// byte string and must take over its entry.
+    /// Insert `key`, overwriting its value if already present (the plain
+    /// [`Self::insert`] assumes absence). Cold; used by the vocab seed.
     pub(crate) fn replace(&mut self, key: u128, h: u64, val: u64, ext: u64) {
         debug_assert_ne!(key, EMPTY_KEY);
         let mut idx = (h as usize) & self.mask & !1;
@@ -380,16 +327,12 @@ impl ShortPretokenCache {
     }
 }
 
-/// See [`ShortPretokenCache::probe_view`]. The pointer is borrowed from
-/// the cache's live allocation; a view taken before an insert may dangle
-/// after it (inserts can grow), so views are chunk-scoped.
+/// See [`ShortPretokenCache::probe_view`]. Borrows the cache's live
+/// allocation; a view taken before an insert may dangle after it.
 #[derive(Clone, Copy)]
 pub(crate) struct ProbeView {
     base: *const Entry,
-    /// `slot mask & !1`, pre-folded: the emit loop computes a pair address
-    /// from this on every probe AND every prefetch, and the fold keeps one
-    /// ALU op (and one live temp in a loop that already spills) off the
-    /// probe-address critical path.
+    /// `slot mask & !1`, pre-folded off the probe-address critical path.
     pair_mask: usize,
 }
 
@@ -401,33 +344,23 @@ impl ProbeView {
         unsafe { self.base.add((h as usize) & self.pair_mask) }
     }
 
-    /// Request the probe's cache line into L1, a few probes ahead of
-    /// [`Self::probe_pair`] (covers the L2 hit latency; the line was staged
-    /// into L2 by [`ShortPretokenCache::prefetch_l2`] a chunk earlier).
+    /// Request the probe's cache line L2 -> L1, a few probes ahead of
+    /// [`Self::probe_pair`].
     #[inline(always)]
     pub(crate) fn prefetch(&self, h: u64) {
         prefetch_line::<true>(self.pair_ptr(h));
     }
 
-    /// Branchless probe of `key`'s home pair: both compares fold into one
-    /// `found` flag and two selects, touching exactly one cache line. On
-    /// `!found` the returned value lanes are another entry's (the emit
-    /// loop's predicate discards them); keys displaced past their pair and
-    /// genuine misses both come back `!found` — the slow path disambiguates
-    /// via [`ShortPretokenCache::get_or_slot`]. Callers must not pass `key == 0`
-    /// expecting a miss: empty slots compare equal to it (the emit
-    /// predicate carries its own `key != 0` term).
+    /// Branchless probe of `key`'s home pair, touching exactly one cache
+    /// line. On `!found` the value lanes are another entry's (displaced
+    /// keys and genuine misses both come back `!found`; the slow path
+    /// disambiguates). `key == 0` compares equal to empty slots, so the
+    /// caller's predicate carries its own `key != 0` term.
     ///
     /// The selects run over unconditionally loaded `val`/`ext` of BOTH
-    /// slots so they are register-value selects. Every pure-Rust spelling
-    /// (`if`, mask arithmetic) gets canonicalized by LLVM into an address
-    /// select — csel of a slot pointer feeding a second, dependent load —
-    /// putting an extra L1 latency on the probe's critical path (the next
-    /// thing waiting on `val` is the emit store and the cursor advance,
-    /// the loop's only carried dependency), so on aarch64 the select is
-    /// two asm `csel`s. Loading all four words up front costs two more
-    /// loads per probe from the same already-touched line, all issued in
-    /// parallel, none dependent on the compares.
+    /// slots: every pure-Rust spelling canonicalizes to an address select
+    /// feeding a dependent load, an extra L1 latency on the critical path,
+    /// so the asm pins register-value csel/cmov.
     #[inline(always)]
     pub(crate) fn probe_pair(&self, key: u128, h: u64) -> (u64, u64, bool) {
         let p = self.pair_ptr(h);
@@ -459,12 +392,6 @@ impl ProbeView {
         };
         #[cfg(target_arch = "x86_64")]
         let (val, ext) = {
-            // LLVM canonicalizes every pure-Rust spelling into an
-            // address-cmov feeding a dependent load — the extra L1 latency
-            // this function exists to avoid; the asm pins register-value
-            // `cmovne`s over the four unconditionally loaded words instead.
-            // cmov is baseline x86-64 (no feature gate); evidence in
-            // profiling/x86_port_plan.md §1.1.
             let (mut val, mut ext) = (e1.val, e1.ext);
             // SAFETY: register-only test + conditional moves; no memory
             // access, no stack use.
@@ -500,10 +427,8 @@ mod tests {
     use super::*;
     use crate::pretokenize::pretoken_key_hash;
 
-    /// The encode miss path inserts at the slot its failed lookup
-    /// reported. Drive that exact flow across several growth passes and
-    /// verify every entry stays retrievable — i.e. `get_or_slot`'s miss
-    /// slot always agrees with where `insert` would have placed the key.
+    /// The miss path inserts at the slot its failed lookup reported; every
+    /// entry must stay retrievable across several growth passes.
     #[test]
     fn get_or_slot_insert_at_roundtrip() {
         let mut cache = ShortPretokenCache::with_pow2_capacity(64);

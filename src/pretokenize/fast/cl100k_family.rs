@@ -1,58 +1,176 @@
-//! Shared mask-scanner boundary algebra for the cl100k regex family:
-//! cl100k, olmo3, qwen2, and qwen3.5. Their patterns share the shape
+//! Shared scalar walker and mask-scanner boundary algebra for the cl100k
+//! regex family: cl100k, olmo3, qwen2, and qwen3.5. Their patterns share
+//! the shape
 //!
 //! `'(?i:contractions)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3} or \p{N}|
 //!  ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 //!
-//! and differ only in the digit-group size (`digits3`), end-of-input
-//! whitespace behavior (always in the scalar tail, never in a batch), and
-//! which unicode classes join runs (`\p{M}`: punct-class for
-//! cl100k/olmo3/qwen2, letter-class for qwen3.5 — expressed by the
-//! codepoint classifier each scheme passes in).
+//! and differ in the digit-group size (`DIGITS3`), whether trailing
+//! whitespace at end of input stays whole (`EOS_WS_WHOLE`, cl100k's
+//! `\s++$`; only the scalar tail ever sees end of input), and whether
+//! `\p{M}` joins letter runs (`MARKS_JOIN`, qwen3.5).
 //!
-//! Boundary rules, derived in `pretokenizer_optimization_log.md` step 16:
+//! Boundary rules:
 //! - A letter starts a token unless it continues a letter run, follows
-//!   space/tab-class whitespace (which always sits at a boundary before a
-//!   non-ws char and absorbs one following letter run via the
-//!   `[^\r\n\p{L}\p{N}]?` prefix), or follows a punct char that is itself
-//!   at a boundary — i.e. whose own predecessor is neither punct nor a
-//!   space (a two-chars-back test, made char-aware for multi-byte chars).
+//!   space/tab-class whitespace (which absorbs one following letter run
+//!   via the `[^\r\n\p{L}\p{N}]?` prefix), or follows a punct char that is
+//!   itself at a boundary — i.e. whose own predecessor is neither punct nor
+//!   a space (a two-chars-back test, char-aware for multi-byte chars).
 //! - Digits split every 1 or 3 chars from each run start and never absorb
 //!   a preceding space.
 //! - A punct char starts a token unless it continues a punct run or
 //!   follows a space (` ?[^\s\p{L}\p{N}]+`).
 //! - Newlines directly after a punct run are absorbed (`[\r\n]*`).
 //! - A whitespace run containing newlines emits one token through its LAST
-//!   newline (`\s*[\r\n]+` / `\s*[\r\n]`), then the r50k-style tail rules;
-//!   NL-free runs split before their last char when followed by non-ws
-//!   (`\s+(?!\S)`). A run touching the batch end resolves in-batch when
-//!   the char at byte 64 is non-ws (the run demonstrably ends at the
-//!   edge — ~16% of OWT batches end in a single space, and deferring
-//!   them was the family's dominant cost, log step 19); a run actually
-//!   crossing the edge is deferred to the scalar path (its "last
-//!   newline" may lie in a later batch).
+//!   newline, then the r50k-style tail rules; NL-free runs split before
+//!   their last char when followed by non-ws (`\s+(?!\S)`). A run touching
+//!   the batch end resolves in-batch when the char at byte 64 is non-ws;
+//!   a run actually crossing the edge defers to the scalar path (its last
+//!   newline may lie in a later batch).
 
-use super::is_ascii_ws;
-use super::mask::{self, AsciiMasks};
-use crate::pretokenize::unicode::CharClass;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use super::mask::{self, AsciiMasks, smear_up};
+use super::{
+    decode_cp, digit_token_end, is_ascii_ws, is_digit, is_letter, letter_end_at,
+    scan_letters_from, scan_newlines, scan_other_from, ws_token_end,
+};
+use crate::pretokenize::unicode::{self, CharClass};
 
-/// Smear `seed` upward (toward higher bits) through contiguous set bits of
-/// `within`, in log steps.
+// Scalar ground truth
+
 #[inline(always)]
-fn smear_up(seed: u64, within: u64) -> u64 {
-    let mut a = seed;
-    let mut m = within;
-    let mut sh = 1u32;
-    while sh < 64 {
-        a |= (a << sh) & m;
-        m &= m << sh;
-        sh <<= 1;
-    }
-    a
+fn ws_end<const EOS_WS_WHOLE: bool>(bytes: &[u8], start: usize) -> usize {
+    ws_token_end::<EOS_WS_WHOLE>(bytes, start, |cp| {
+        unicode::class_of(cp) == CharClass::Whitespace
+    })
 }
+
+/// Advance past one token starting at `pos`. Returns the new position.
+/// `pos` must be < `bytes.len()`.
+#[inline(always)]
+pub(crate) fn advance_pos<const DIGITS3: bool, const EOS_WS_WHOLE: bool>(
+    bytes: &[u8],
+    pos: usize,
+) -> usize {
+    let b0 = unsafe { *bytes.get_unchecked(pos) };
+
+    // Hot path 1: ASCII letter — `\p{L}+` with empty prefix
+    if is_letter(b0) {
+        return scan_letters_from(bytes, pos + 1);
+    }
+
+    // Hot path 2: space prefix
+    if b0 == b' ' {
+        let Some(&b1) = bytes.get(pos + 1) else {
+            return pos + 1; // trailing lone space
+        };
+        if is_letter(b1) {
+            return scan_letters_from(bytes, pos + 2); // " word"
+        }
+        if b1 < 0x80 {
+            if is_digit(b1) {
+                return pos + 1; // numbers never absorb the space
+            }
+            if is_ascii_ws(b1) {
+                return ws_end::<EOS_WS_WHOLE>(bytes, pos);
+            }
+            // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+            let p = scan_other_from(bytes, pos + 2);
+            return scan_newlines(bytes, p);
+        }
+        let (cp, l) = unsafe { decode_cp(bytes, pos + 1) };
+        let p1 = pos + 1 + l;
+        match unicode::class_of(cp) {
+            CharClass::Letter => return scan_letters_from(bytes, p1),
+            CharClass::Whitespace => return ws_end::<EOS_WS_WHOLE>(bytes, pos),
+            CharClass::Number => return pos + 1,
+            CharClass::Other => {
+                let p = scan_other_from(bytes, p1);
+                return scan_newlines(bytes, p);
+            }
+        }
+    }
+
+    // Non-ASCII
+    if b0 >= 0x80 {
+        let (cp, l) = unsafe { decode_cp(bytes, pos) };
+        let p0 = pos + l;
+        let class = unicode::class_of(cp);
+        if class == CharClass::Letter {
+            return scan_letters_from(bytes, p0);
+        }
+        if class == CharClass::Number {
+            return digit_token_end::<DIGITS3>(bytes, p0);
+        }
+        // Any non-letter/number char except \r\n may prefix a letter run
+        if let Some(p) = letter_end_at(bytes, p0) {
+            return scan_letters_from(bytes, p);
+        }
+        if class == CharClass::Whitespace {
+            return ws_end::<EOS_WS_WHOLE>(bytes, pos);
+        }
+        let p = scan_other_from(bytes, p0);
+        return scan_newlines(bytes, p);
+    }
+
+    // ASCII digit
+    if is_digit(b0) {
+        return digit_token_end::<DIGITS3>(bytes, pos + 1);
+    }
+
+    // Apostrophe: case-insensitive contractions
+    if b0 == b'\'' {
+        match bytes.get(pos + 1).map(u8::to_ascii_lowercase) {
+            Some(b's' | b'd' | b'm' | b't') => return pos + 2,
+            Some(b'l') if bytes.get(pos + 2).map(u8::to_ascii_lowercase) == Some(b'l') => {
+                return pos + 3;
+            }
+            Some(b'v') if bytes.get(pos + 2).map(u8::to_ascii_lowercase) == Some(b'e') => {
+                return pos + 3;
+            }
+            Some(b'r') if bytes.get(pos + 2).map(u8::to_ascii_lowercase) == Some(b'e') => {
+                return pos + 3;
+            }
+            _ => {}
+        }
+        // U+017F LATIN SMALL LETTER LONG S case-folds to 's' under `(?i)`
+        if bytes.get(pos + 1) == Some(&0xC5) && bytes.get(pos + 2) == Some(&0xBF) {
+            return pos + 3;
+        }
+        // Not a contraction: `'` can still prefix a letter run
+        if let Some(p) = letter_end_at(bytes, pos + 1) {
+            return scan_letters_from(bytes, p);
+        }
+        let p = scan_other_from(bytes, pos + 1);
+        return scan_newlines(bytes, p);
+    }
+
+    // \r and \n are excluded from the letter-run prefix
+    if b0 == b'\r' || b0 == b'\n' {
+        return ws_end::<EOS_WS_WHOLE>(bytes, pos);
+    }
+
+    // Other ASCII whitespace (\t, \x0b, \x0c) may prefix a letter run
+    if is_ascii_ws(b0) {
+        if let Some(p) = letter_end_at(bytes, pos + 1) {
+            return scan_letters_from(bytes, p);
+        }
+        return ws_end::<EOS_WS_WHOLE>(bytes, pos);
+    }
+
+    // ASCII punctuation/symbol
+    if let Some(p) = letter_end_at(bytes, pos + 1) {
+        return scan_letters_from(bytes, p);
+    }
+    let p = scan_other_from(bytes, pos + 1);
+    scan_newlines(bytes, p)
+}
+
+// Mask-scanner boundary algebra
 
 /// Boundary carries from the two chars before the batch: P1 ends at
 /// `scan - 1`, P2 is the one before it (the two-chars-back absorb test).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Default)]
 struct Carries {
     /// P1 is a letter / space (0x20) / non-newline non-space ws / punct /
@@ -100,26 +218,16 @@ fn ascii_carries(bytes: &[u8], scan: usize) -> Carries {
 }
 
 /// `(usable, bad)` for `bytes[scan..scan+64]` under the cl100k-family
-/// rules. `digits3`: `\p{N}{1,3}` (cl100k/olmo3) vs `\p{N}` (qwen2/3.5).
-/// `class`: the scheme's codepoint classifier — `unicode::class_of` for
-/// cl100k/olmo3/qwen2 (marks are punct-class), or
-/// `unicode::class_of_marks_join` for qwen3.5 (`\p{M}` joins letter
-/// runs).
-///
-/// Structured like the r50k scanner (log step 17): NEON classifies the
-/// ASCII classes with 5 movemasks (letter, digit, space, whitespace,
-/// newline; `wt` is derived in bit algebra, apostrophe and non-ASCII sit
-/// behind horizontal any-tests) and the pure-ASCII boundary algebra stays
-/// inline; batches with any non-ASCII byte in or just before them take
-/// [`family_extended_masks`], `#[inline(never)]` so the hot path's
-/// register allocation stays clean.
+/// rules (`DIGITS3`: `\p{N}{1,3}` vs `\p{N}`; `MARKS_JOIN`: `\p{M}` joins
+/// letter runs). NEON classifies the ASCII classes and the pure-ASCII
+/// boundary algebra stays inline; batches with any non-ASCII byte in or
+/// just before them take [`family_extended_masks`], `#[inline(never)]` so
+/// the hot path's register allocation stays clean.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-pub(crate) fn batch_masks(
+pub(crate) fn batch_masks<const DIGITS3: bool, const MARKS_JOIN: bool>(
     bytes: &[u8],
     scan: usize,
-    digits3: bool,
-    class: impl Fn(u32) -> CharClass + Copy,
 ) -> (u64, u64) {
     use std::arch::aarch64::*;
     let len = bytes.len();
@@ -188,26 +296,19 @@ pub(crate) fn batch_masks(
         {
             let mut am = am;
             am.hi = mask::movemask64(hiv[0], hiv[1], hiv[2], hiv[3]);
-            return family_extended_masks(bytes, scan, digits3, class, am);
+            return family_extended_masks::<DIGITS3, MARKS_JOIN>(bytes, scan, am);
         }
 
         let cr = if scan == 0 { Carries::default() } else { ascii_carries(bytes, scan) };
-        family_algebra(bytes, scan, digits3, am, cr, mask::UniClasses::default())
+        family_algebra::<DIGITS3>(bytes, scan, am, cr, mask::UniClasses::default())
     }
 }
 
-/// x86-64 front-end for the family schemes: same contract as the NEON
-/// `batch_masks` above, monomorphized on the SIMD tier (see
-/// `MaskScheme::batch_masks_x86`, whose provided `batch_masks` supplies
-/// the runtime-dispatched form). The classification is
-/// [`mask::ascii_masks_avx512`] (one 64-byte load and one k-register
-/// compare per class) or [`mask::ascii_masks_avx2`] (two 32-byte loads,
-/// compare + vpmovmskb per class); the boundary algebra and the extended
-/// (non-ASCII) path are the shared scalar code. `#[inline(always)]` (with
-/// no `target_feature` of its own) so the body fuses into whichever
-/// feature region calls it — LLVM's cost model declined to inline the
-/// previous `#[target_feature]` form into the tier-monomorphized fill
-/// wrappers and left a call per 64-byte batch.
+/// x86-64 front-end: same contract as the NEON `batch_masks`, monomorphized
+/// on the SIMD tier (see `MaskScheme::batch_masks_x86`). `#[inline(always)]`
+/// with no `target_feature` of its own, so the body fuses into whichever
+/// feature region calls it (LLVM declined to inline a `#[target_feature]`
+/// form into the fill wrappers).
 ///
 /// # Safety
 ///
@@ -216,11 +317,13 @@ pub(crate) fn batch_masks(
 /// [`mask::avx2_scanner_available`]).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub(crate) unsafe fn batch_masks_x86<const AVX512: bool>(
+pub(crate) unsafe fn batch_masks_x86<
+    const AVX512: bool,
+    const DIGITS3: bool,
+    const MARKS_JOIN: bool,
+>(
     bytes: &[u8],
     scan: usize,
-    digits3: bool,
-    class: impl Fn(u32) -> CharClass + Copy,
 ) -> (u64, u64) {
     let len = bytes.len();
     if scan + 70 > len {
@@ -245,46 +348,38 @@ pub(crate) unsafe fn batch_masks_x86<const AVX512: bool>(
     {
         // SAFETY: both detected tiers include the BMI1/BMI2/LZCNT/POPCNT
         // bit features `family_extended_masks` re-declares (fn contract).
-        return unsafe { family_extended_masks(bytes, scan, digits3, class, am) };
+        return unsafe { family_extended_masks::<DIGITS3, MARKS_JOIN>(bytes, scan, am) };
     }
 
     let cr = if scan == 0 { Carries::default() } else { ascii_carries(bytes, scan) };
-    family_algebra(bytes, scan, digits3, am, cr, mask::UniClasses::default())
+    family_algebra::<DIGITS3>(bytes, scan, am, cr, mask::UniClasses::default())
 }
 
 /// Slow(er) path for batches with non-ASCII in or just before them: the
-/// carries walk back through multi-byte chars and classify with the
-/// packed table, so a batch following unicode text gets true carries
-/// instead of a bit-0 bad zone; every unicode char in the batch is
-/// classified with the same table and joins the effective class masks
-/// ([`mask::classify_uni_chars`]); then the shared boundary algebra
-/// applies unchanged. Only number chars (their `\p{N}{1,3}` grouping is
-/// char-counted, inexpressible in byte masks), whitespace straddling the
-/// batch end, and stray continuation bytes stay bad zones.
-///
-/// On x86_64 the `target_feature` re-declaration keeps the bit-scan
-/// loops on tzcnt/lzcnt/blsr in a baseline (non-native) build — this
-/// function is out-of-line, so without it the ~21% of OWT batches
-/// landing here would compile against baseline x86-64 even though every
-/// caller is a SIMD batch classifier. Only the bit features are enabled
-/// (not the callers' vector features): both the AVX-512 and AVX2 tiers
-/// call this, so it must never emit instructions beyond the AVX2 tier's
-/// set. Measured neutral on the OWT mask-compute diagnostic
-/// (ASCII-dominated); kept for codegen parity on non-ASCII-heavy corpora
-/// where this path dominates.
+/// carries walk back through multi-byte chars and every unicode char in
+/// the batch joins the effective class masks ([`mask::classify_uni_chars`]),
+/// then the shared boundary algebra applies unchanged. Only number chars
+/// (char-counted `\p{N}{1,3}` grouping), whitespace straddling the batch
+/// end, and stray continuation bytes stay bad zones. `#[inline(never)]`
+/// keeps the walker's register allocation clean; the x86 `target_feature`
+/// keeps its bit scans on tzcnt/lzcnt/blsr in a baseline build (see
+/// `mask.rs`).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[cfg_attr(
     target_arch = "x86_64",
     target_feature(enable = "bmi1,bmi2,lzcnt,popcnt")
 )]
 #[inline(never)]
-fn family_extended_masks(
+fn family_extended_masks<const DIGITS3: bool, const MARKS_JOIN: bool>(
     bytes: &[u8],
     scan: usize,
-    digits3: bool,
-    class: impl Fn(u32) -> CharClass + Copy,
     am: mask::AsciiMasks,
 ) -> (u64, u64) {
+    // Class-table LazyLock resolved once; the per-char classify below is
+    // then a bare slice index.
+    let ct = unicode::ClassTable::<MARKS_JOIN>::get();
+    let class = move |cp| ct.class_of(cp);
+
     // A P1 straddling into the batch claims its continuation bytes with
     // its class; `b2b_in` is the two-back test for the char right after
     // it, whose predecessor chain starts before the batch.
@@ -321,15 +416,10 @@ fn family_extended_masks(
                 cl.l = chm;
                 c.pl = 1;
             }
-            // A digit P1 sets no letter/punct carries: `\p{N}` groups
-            // restart at token boundaries. A P1 entirely before the batch
-            // is covered by the `pd` seed (bit 0 is then an ASCII digit
-            // when the run continues). A digit char STRADDLING into the
-            // batch defeats that seed — bit 0 is its continuation byte,
-            // not an ASCII digit — so its claimed bytes defer via resid
-            // and the bad<<1 seed catches the following run. (Found by
-            // the o200k-family port's differential fuzz: "٢1234" with the
-            // ٢ split across a batch edge mis-phased `\p{N}{1,3}`.)
+            // A digit P1 sets no letter/punct carries (`\p{N}` groups
+            // restart at token boundaries). One straddling into the batch
+            // defeats the `pd` seed (bit 0 is its continuation byte, not
+            // an ASCII digit), so its bytes defer via resid instead.
             CharClass::Number => {
                 cl.n = chm;
                 cl.resid |= chm;
@@ -367,7 +457,7 @@ fn family_extended_masks(
     uni.cont |= cl.cont;
     uni.resid |= cl.resid;
 
-    family_algebra(bytes, scan, digits3, am, cr, uni)
+    family_algebra::<DIGITS3>(bytes, scan, am, cr, uni)
 }
 
 /// The scheme family's shared u64 boundary algebra over per-byte class
@@ -376,10 +466,9 @@ fn family_extended_masks(
 /// with straddle-in claims already merged in.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-fn family_algebra(
+fn family_algebra<const DIGITS3: bool>(
     bytes: &[u8],
     scan: usize,
-    digits3: bool,
     am: mask::AsciiMasks,
     cr: Carries,
     uni: mask::UniClasses,
@@ -416,7 +505,7 @@ fn family_algebra(
 
     // --- Digits: `\p{N}{1,3}` or `\p{N}` -----------------------------------
     // The run-split hop loop only runs when a run of 2+ digits exists.
-    let b_digits = if digits3 && am.d & (am.d >> 1) != 0 {
+    let b_digits = if DIGITS3 && am.d & (am.d >> 1) != 0 {
         mask::digit_run_splits3(am.d)
     } else {
         am.d
@@ -436,14 +525,9 @@ fn family_algebra(
     let mut bad = resid | resid << 1 | resid >> 1;
 
     // Byte-64 lookahead: is the char at the next batch's first byte
-    // non-ws? Decides whether ws-like runs touching bit 63 resolve
-    // in-batch — the dominant deferral cause before this existed (~16% of
-    // OWT batches ended in a single space). Branchless for an ASCII byte
-    // 64 as in the r50k scanner ("is the edge ws" is a ~20% coin flip on
-    // natural text); only a non-ASCII byte 64 (rare) branches, for the
-    // table-backed check. Guarded on `bad >> 63`: a ws char straddling
-    // out makes byte 64 a continuation byte, not a lead (only reachable
-    // with a non-ASCII byte 64).
+    // non-ws? Branchless for an ASCII byte 64 (a ~20% coin flip on natural
+    // text); only a non-ASCII byte 64 branches. Guarded on `bad >> 63`: a
+    // ws char straddling out makes byte 64 a continuation byte, not a lead.
     let nb64 = bytes[scan + 64]; // in bounds: scan + 70 <= len
     let nn64 = if nb64 < 0x80 {
         !is_ascii_ws(nb64)
@@ -477,23 +561,12 @@ fn family_algebra(
         bad |= u64::MAX << (h + 1);
     }
 
-    // A digit run crossing the batch END needs no deferral: its in-batch
-    // `\p{N}{1,3}` splits are phased from the run's in-batch start (a
-    // continuation from before the batch is the `pd` case below), and
-    // they are token starts no matter how far the run continues — the
-    // NEXT batch defers its own leading run via its `pd` seed and the
-    // scalar path resumes from the last in-batch split.
-
-    // A digit run whose grouping phase did not start inside this batch is
-    // deferred too: `digit_run_splits3` phases each run from its first
-    // in-batch digit, which is wrong when the run continues from before
-    // the batch (`pd`: the walker stays on the 64-byte grid across scalar
-    // overruns, so a batch can begin mid-run) or follows a bad zone that
-    // may hold digit-class chars (e.g. Arabic-Indic digits, kept out of
-    // the mask because `\p{N}{1,3}` counts chars, not bytes — a latent
-    // bug that predates the table classifier, caught when Arabic-Indic
-    // digits joined the fuzz corpus).
-    if digits3 {
+    // A digit run crossing the batch END needs no deferral (its in-batch
+    // splits are phased from its in-batch start). One whose phase did NOT
+    // start in this batch — continuing from before it (`pd`) or following
+    // a bad zone that may hold digit-class chars — defers, since
+    // `digit_run_splits3` phases every run from its first in-batch digit.
+    if DIGITS3 {
         let seed = (am.d & (bad << 1)) | (am.d & pd);
         if seed != 0 {
             bad |= smear_up(seed, am.d);
@@ -517,10 +590,7 @@ fn family_algebra(
 
     // Override every run that contains a (non-absorbed) newline: one token
     // through the run's last newline, then r50k-style tail rules. (A
-    // branchless formulation via a downward smear — add the tail-start
-    // bit after each run's last newline, clear the split bit sitting on
-    // it — measured 0.95x: the smear's serial chain runs every batch
-    // while this loop is skipped or predicted on most.)
+    // branchless downward-smear formulation measured 0.95x; keep the loop.)
     let mut runs_n = am.n & ws_eff & !bad;
     while runs_n != 0 {
         let f = runs_n.trailing_zeros();
@@ -561,10 +631,8 @@ fn family_algebra(
         }
         let b1 = bytes[scan + i + 1];
         if b1 >= 0x80 {
-            // `(?i:'s)` also matches 'ſ (U+017F folds to s). With the
-            // table now classifying ſ as a letter instead of leaving it
-            // in a bad zone, an apostrophe before ANY non-ASCII char
-            // must defer to the scalar path explicitly.
+            // `(?i:'s)` also matches 'ſ (U+017F): an apostrophe before any
+            // non-ASCII char defers to the scalar path.
             bad |= 0b111u64 << i;
             continue;
         }
@@ -587,51 +655,39 @@ fn family_algebra(
 #[cfg(test)]
 mod tests {
     use crate::pretokenize::fast::cl100k::Cl100kScheme;
-    use crate::pretokenize::fast::mask::{MaskScheme, MaskState};
     use crate::pretokenize::fast::olmo3::Olmo3Scheme;
     use crate::pretokenize::fast::qwen2::Qwen2Scheme;
     use crate::pretokenize::fast::qwen3_5::Qwen35Scheme;
-
-    fn scalar_tokens<S: MaskScheme>(bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut pos = 0;
-        let mut out = vec![];
-        while pos < bytes.len() {
-            let e = S::advance(bytes, pos);
-            out.push(bytes[pos..e].to_vec());
-            pos = e;
-        }
-        out
-    }
-
-    fn mask_tokens<S: MaskScheme>(bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut st = MaskState::new(0);
-        let mut out = vec![];
-        while let Some((s, e)) = st.next_span::<S>(bytes) {
-            out.push(bytes[s..e].to_vec());
-        }
-        out
-    }
+    use crate::pretokenize::fast::test_support::*;
 
     #[track_caller]
-    fn check_one<S: MaskScheme>(buf: &[u8], scheme: &str) {
-        let a = scalar_tokens::<S>(buf);
-        let b = mask_tokens::<S>(buf);
-        if a != b {
-            let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-            panic!(
-                "{scheme} diverged at token {i} on {:?}\n  scalar: {:?}\n  mask:   {:?}",
-                String::from_utf8_lossy(buf),
-                a.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-                b.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-            );
-        }
+    fn check_all(buf: &[u8]) {
+        check_scalar_vs_mask::<Olmo3Scheme>(buf, "olmo3");
+        check_scalar_vs_mask::<Cl100kScheme>(buf, "cl100k");
+        check_scalar_vs_mask::<Qwen2Scheme>(buf, "qwen2");
+        check_scalar_vs_mask::<Qwen35Scheme>(buf, "qwen3_5");
     }
 
-    fn check_all(buf: &[u8]) {
-        check_one::<Olmo3Scheme>(buf, "olmo3");
-        check_one::<Cl100kScheme>(buf, "cl100k");
-        check_one::<Qwen2Scheme>(buf, "qwen2");
-        check_one::<Qwen35Scheme>(buf, "qwen3_5");
+    fn check_streaming_all(bytes: &[u8]) {
+        check_streaming::<Olmo3Scheme>(bytes, "olmo3");
+        check_streaming::<Cl100kScheme>(bytes, "cl100k");
+        check_streaming::<Qwen2Scheme>(bytes, "qwen2");
+        check_streaming::<Qwen35Scheme>(bytes, "qwen3_5");
+    }
+
+    /// The batch classifier must engage on plain ASCII (real token starts,
+    /// no bad zones) rather than pass via the scalar fallback.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn family_classifier_engages_on_ascii() {
+        use crate::pretokenize::fast::mask::{self, MaskScheme};
+        if !mask::simd_scanner_available() {
+            return;
+        }
+        let text = b"The quick brown fox jumps over the lazy dog while 42 geese watch on quietly";
+        let (usable, bad) = Cl100kScheme::batch_masks(text, 0);
+        assert_eq!(bad, 0, "plain ASCII must produce no bad zones");
+        assert!(usable.count_ones() >= 10, "classifier found too few boundaries");
     }
 
     /// Crafted cases, padded so they cross the batch (not scalar-tail) path.
@@ -661,11 +717,9 @@ mod tests {
         }
     }
 
-    /// A multi-byte digit char straddling a batch edge, followed by
-    /// ASCII digits: the `\p{N}{1,3}` phase starts at the straddling
-    /// char, which the `pd` seed alone cannot see (bit 0 is a
-    /// continuation byte). Regression for the resid fix in
-    /// `family_extended_masks`; lead 127 was the failing alignment.
+    /// A multi-byte digit char straddling a batch edge, followed by ASCII
+    /// digits: the `\p{N}{1,3}` phase starts at the straddling char, which
+    /// the `pd` seed alone cannot see (bit 0 is a continuation byte).
     #[test]
     fn family_straddling_digit_char_phase() {
         for lead in 100..200usize {
@@ -687,205 +741,23 @@ mod tests {
             "\tx", " x", "?!", "\u{301}", "ſ", "'ſ", "'\u{301}", "\u{661}\u{662}",
             "\u{FF11}", "क", "\u{940}", "\u{1D54F}", "€", "™", "…\u{2028}",
         ];
-        let mut state = 0x243F6A8885A308D3u64;
-        let mut rng = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = xorshift(0x243F6A8885A308D3);
         for round in 0..3000 {
-            let target = 80 + (round % 400);
-            let mut buf = Vec::new();
-            while buf.len() < target {
-                buf.extend_from_slice(pieces[(rng() % pieces.len() as u64) as usize].as_bytes());
-            }
-            check_all(&buf);
+            check_all(&soup(pieces, 80 + (round % 400), &mut rng));
         }
     }
-}
 
-#[cfg(test)]
-mod owt_tests {
-    use super::tests_support::*;
-
-    /// Diagnostic: per-batch mask-compute cost, r50k vs cl100k, same
-    /// input, walker excluded. Local instantiations (inline fns), so
-    /// relative timing is honest despite test builds skipping fat LTO.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    #[test]
-    #[ignore]
-    fn family_vs_r50k_mask_compute_cost() {
-        use crate::pretokenize::fast::cl100k::Cl100kScheme;
-        use crate::pretokenize::fast::mask::MaskScheme;
-        use crate::pretokenize::fast::r50k::R50kScheme;
-        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
-        use std::io::Read;
-        let f = std::fs::File::open(&path).unwrap();
-        let mut input = Vec::new();
-        f.take(1_000_000_000).read_to_end(&mut input).unwrap();
-        while !input.is_empty() && std::str::from_utf8(&input).is_err() {
-            input.pop();
-        }
-        let mb = input.len() as f64 / 1e6;
-        fn drive<S: MaskScheme>(input: &[u8]) -> u64 {
-            let mut acc = 0u64;
-            let mut scan = 0usize;
-            while scan + 70 <= input.len() {
-                let (u, b) = S::batch_masks(input, scan);
-                acc = acc.wrapping_add(u ^ b);
-                scan += 64;
-            }
-            acc
-        }
-        std::hint::black_box(drive::<R50kScheme>(&input));
-        std::hint::black_box(drive::<Cl100kScheme>(&input));
-        let (mut best_r, mut best_c) = (f64::INFINITY, f64::INFINITY);
-        for round in 0..5 {
-            let t = std::time::Instant::now();
-            std::hint::black_box(drive::<R50kScheme>(&input));
-            let dr = t.elapsed().as_secs_f64();
-            let t = std::time::Instant::now();
-            std::hint::black_box(drive::<Cl100kScheme>(&input));
-            let dc = t.elapsed().as_secs_f64();
-            best_r = best_r.min(dr);
-            best_c = best_c.min(dc);
-            eprintln!("round {round}: r50k {:.0} MB/s | cl100k {:.0} MB/s", mb / dr, mb / dc);
-        }
-        eprintln!(
-            "best: r50k {:.0} MB/s ({:.2} cy/B) | cl100k {:.0} MB/s ({:.2} cy/B) | ratio {:.3}x",
-            mb / best_r,
-            4.5e9 * best_r / (mb * 1e6),
-            mb / best_c,
-            4.5e9 * best_c / (mb * 1e6),
-            best_c / best_r,
-        );
-    }
-
-    /// Diagnostic census: why do cl100k batches go dirty on OWT?
-    /// (2026-07-07, 1 GB: 1.36% dirty — 0.20% ap/abs-edge cases behind a
-    /// ws@63, 0.40% ws runs truly crossing the edge, 0.05% digit `pd`
-    /// defers, 0.10% unicode resid, 0.61% other [mostly contraction
-    /// spills and `pd` continuations]; was 18.62% before the byte-64
-    /// edge resolution.)
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    #[test]
-    #[ignore]
-    fn family_deferral_census() {
-        use crate::pretokenize::fast::mask::MaskScheme;
-        use crate::pretokenize::fast::cl100k::Cl100kScheme;
-        use crate::pretokenize::fast::{is_ascii_ws, is_digit};
-        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
-        use std::io::Read;
-        let f = std::fs::File::open(&path).unwrap();
-        let mut input = Vec::new();
-        f.take(1_000_000_000).read_to_end(&mut input).unwrap();
-        while !input.is_empty() && std::str::from_utf8(&input).is_err() {
-            input.pop();
-        }
-        let (mut batches, mut dirty, mut gap_bytes) = (0usize, 0usize, 0u64);
-        // categories (a dirty batch may hit several; count first that applies)
-        let (mut ws63_next_nonws, mut ws63_next_ws, mut digit63, mut hi_any, mut other) =
-            (0usize, 0usize, 0usize, 0usize, 0usize);
-        let mut scan = 0usize;
-        while scan + 70 <= input.len() {
-            let (usable, bad) = Cl100kScheme::batch_masks(&input, scan);
-            batches += 1;
-            if bad != 0 {
-                dirty += 1;
-                let first_bad = bad.trailing_zeros();
-                let rest = usable & (u64::MAX << first_bad);
-                let resume = if rest != 0 { rest.trailing_zeros() } else { 64 };
-                gap_bytes += u64::from(resume - first_bad);
-                let b63 = input[scan + 63];
-                let b64 = input[scan + 64];
-                let ws63 = is_ascii_ws(b63);
-                if ws63 && !is_ascii_ws(b64) && b64 < 0x80 {
-                    ws63_next_nonws += 1;
-                } else if ws63 {
-                    ws63_next_ws += 1;
-                } else if is_digit(b63) {
-                    digit63 += 1;
-                } else if input[scan..scan + 64].iter().any(|&b| b >= 0x80) {
-                    hi_any += 1;
-                } else {
-                    other += 1;
-                }
-            }
-            scan += 64;
-        }
-        let pct = |n: usize| 100.0 * n as f64 / batches as f64;
-        eprintln!("batches {batches}, dirty {dirty} ({:.2}%)", pct(dirty));
-        eprintln!("  ws@63, byte64 non-ws ASCII: {ws63_next_nonws} ({:.2}%)", pct(ws63_next_nonws));
-        eprintln!("  ws@63, byte64 ws/hi:        {ws63_next_ws} ({:.2}%)", pct(ws63_next_ws));
-        eprintln!("  digit@63:                   {digit63} ({:.2}%)", pct(digit63));
-        eprintln!("  hi in batch:                {hi_any} ({:.2}%)", pct(hi_any));
-        eprintln!("  other:                      {other} ({:.2}%)", pct(other));
-        eprintln!("first-gap bytes: {:.2}%", 100.0 * gap_bytes as f64 / input.len() as f64);
-    }
-
-    /// Full-OWT (~12 GB) mask-vs-scalar differential for all four family
-    /// schemes. Streams token-by-token; ~4 min total.
-    #[test]
-    #[ignore = "reads the full ~12 GB OWT file"]
-    fn family_mask_matches_scalar_owt_full() {
-        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
-        let input = std::fs::read(&path).expect("Could not read ~/data/owt_train.txt");
-        eprintln!("loaded {} bytes", input.len());
-        check_streaming_all(&input);
-    }
-
-    /// 100 MB variant for quicker iteration.
+    /// 100 MB of OWT, mask vs scalar, for all four family schemes.
     #[test]
     #[ignore]
     fn family_mask_matches_scalar_owt() {
-        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
-        use std::io::Read;
-        let f = std::fs::File::open(&path).unwrap();
-        let mut input = Vec::new();
-        f.take(100_000_000).read_to_end(&mut input).unwrap();
-        while !input.is_empty() && std::str::from_utf8(&input).is_err() {
-            input.pop();
-        }
-        check_streaming_all(&input);
-    }
-}
-
-#[cfg(test)]
-mod tests_support {
-    use crate::pretokenize::fast::cl100k::Cl100kScheme;
-    use crate::pretokenize::fast::mask::{MaskScheme, MaskState};
-    use crate::pretokenize::fast::olmo3::Olmo3Scheme;
-    use crate::pretokenize::fast::qwen2::Qwen2Scheme;
-    use crate::pretokenize::fast::qwen3_5::Qwen35Scheme;
-
-    fn check_streaming<S: MaskScheme>(bytes: &[u8], scheme: &str) {
-        let mut st = MaskState::new(0);
-        let mut pos = 0usize;
-        let mut idx = 0usize;
-        while pos < bytes.len() {
-            let scalar_end = S::advance(bytes, pos);
-            match st.next_span::<S>(bytes) {
-                Some((s, e)) => assert!(
-                    s == pos && e == scalar_end,
-                    "{scheme} diverged at token {idx} (byte {pos}): scalar {pos}..{scalar_end} \
-                     mask {s}..{e}: {:?} vs {:?}",
-                    String::from_utf8_lossy(&bytes[pos..scalar_end]),
-                    String::from_utf8_lossy(&bytes[s..e]),
-                ),
-                None => panic!("{scheme} ended early at token {idx} (byte {pos})"),
-            }
-            pos = scalar_end;
-            idx += 1;
-        }
-        assert!(st.next_span::<S>(bytes).is_none(), "{scheme} produced extra tokens");
-        eprintln!("{scheme}: all {idx} tokens match");
+        check_streaming_all(&load_owt_prefix(100_000_000));
     }
 
-    pub(super) fn check_streaming_all(bytes: &[u8]) {
-        check_streaming::<Olmo3Scheme>(bytes, "olmo3");
-        check_streaming::<Cl100kScheme>(bytes, "cl100k");
-        check_streaming::<Qwen2Scheme>(bytes, "qwen2");
-        check_streaming::<Qwen35Scheme>(bytes, "qwen3_5");
+    /// Full-OWT (~12 GB) variant; ~4 min total.
+    #[test]
+    #[ignore = "reads the full ~12 GB OWT file"]
+    fn family_mask_matches_scalar_owt_full() {
+        check_streaming_all(&load_owt_prefix(usize::MAX));
     }
 }

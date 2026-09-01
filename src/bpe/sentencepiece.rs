@@ -1,4 +1,4 @@
-use crate::bpe::bpe_merge_symbols_ranked;
+use crate::bpe::{RankedMerges, bpe_merge_symbols_ranked};
 use crate::pretokenize::pack_pretoken_key;
 use crate::token::TokenId;
 use rustc_hash::FxBuildHasher;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// SentencePiece uses U+2581 (▁) as a space marker.
 const SENTENCEPIECE_SPACE: char = '\u{2581}';
 const SENTENCEPIECE_SPACE_STR: &str = "\u{2581}";
-const SP_MARK: [u8; 3] = [0xE2, 0x96, 0x81]; // UTF-8 bytes of ▁
+const SP_MARK: [u8; 3] = [0xE2, 0x96, 0x81];
 
 /// How text divides into independently-encodable (and cacheable) word units.
 /// Computed once at load from the pre-tokenizer config and the vocab.
@@ -227,74 +227,51 @@ pub struct AddedTokenSpec {
     pub rstrip: bool,
 }
 
-/// A tokenizer that mirrors SentencePiece BPE with `byte_fallback`.
-///
-/// This struct holds the immutable model data (vocab, merges, added tokens,
-/// normalizer configuration). For encoding, create an [`Encoder`] which
-/// processes text through the normalize → character init → BPE merge pipeline.
+/// A tokenizer that mirrors SentencePiece BPE with `byte_fallback`. Holds
+/// the immutable model; an [`Encoder`] adds the per-thread cache and scratch.
 pub struct SentencePieceBPE {
-    /// Merges with explicit rank, keyed by [`crate::bpe::ranked_merge_key`]:
-    /// `key(a, b) → (merged, rank)`.
-    pub(crate) merges: HashMap<u64, (TokenId, u32), FxBuildHasher>,
+    /// `ranked_merge_key(a, b) → (merged, rank)`.
+    pub(crate) merges: RankedMerges,
     pub(crate) vocab: Vec<Arc<[u8]>>,
-    /// Maps byte sequences → token IDs (for character lookup).
     pub(crate) vocab_inv: HashMap<Arc<[u8]>, TokenId, FxBuildHasher>,
-    /// Token ID for each byte value (0x00–0xFF) via `<0xHH>` fallback tokens.
-    /// `None` when the vocab lacks that byte's token (e.g. Gemma has literal
-    /// `\t` pieces instead of `<0x09>`); such bytes can then only appear in
-    /// text as chars the vocab covers, so the fallback is never consulted.
+    /// Token ID of each byte's `<0xHH>` fallback piece; `None` when the
+    /// vocab lacks it (such bytes then only occur inside chars it covers).
     pub(crate) byte_fallback_ids: [Option<TokenId>; 256],
     /// Added tokens with `normalized: false`, matched in the raw input.
     pub(crate) added_tokens: Vec<AddedTokenSpec>,
-    /// Added tokens with `normalized: true`, matched (with pre-normalized
-    /// content) against normalizer output, before the Metaspace step.
+    /// Added tokens with `normalized: true`, matched (pre-normalized)
+    /// against normalizer output, before the Metaspace step.
     pub(crate) norm_added_tokens: Vec<AddedTokenSpec>,
     /// The tokenizer.json normalizer sequence, applied per chunk in order.
     pub(crate) norm_ops: Vec<NormOp>,
-    /// The Metaspace pre-tokenizer, if the tokenizer.json has one. `None`
-    /// (e.g. Llama 2) means spaces are already handled by `norm_ops` and
-    /// merges may cross word boundaries.
+    /// The Metaspace pre-tokenizer, if any (`None`: `norm_ops` handles
+    /// spaces and merges may cross word boundaries).
     pub(crate) metaspace: Option<Metaspace>,
-    /// Unit-splitting mode; see [`WordSplit`]. Set by `finalize_speed_paths`.
+    // Everything below is derived by `finalize_speed_paths`.
+    /// Unit-splitting mode; see [`WordSplit`].
     pub(crate) word_split: WordSplit,
-    /// `Some` when the whole normalizer pipeline reduces to
-    /// optional-▁-prepend + space→▁, so encoding can split raw text directly
-    /// without materializing a normalized string. Set by
-    /// `finalize_speed_paths`.
+    /// `Some` when the normalizer pipeline reduces to optional ▁-prepend +
+    /// space→▁, so raw text splits into units directly.
     pub(crate) raw_prepend: Option<RawPrepend>,
-    /// Initial symbol(s) for the ▁ marker (its vocab piece, or its UTF-8
-    /// bytes through byte fallback). Set by `finalize_speed_paths`.
+    /// Initial symbol(s) for the ▁ marker (vocab piece, or byte fallback).
     pub(crate) space_init: Vec<TokenId>,
-    /// Initial symbol for each ASCII char: its single-char vocab piece or its
-    /// byte-fallback token, skipping the per-char `vocab_inv` probe on the
-    /// merge path. `None` = the byte has no token at all. Set by
-    /// `finalize_speed_paths`.
+    /// Initial symbol per ASCII char (vocab piece or byte fallback; `None`
+    /// = no token).
     pub(crate) ascii_init: [Option<TokenId>; 128],
-    /// Leftmost-longest automaton over `added_tokens` contents (pattern index
-    /// == `added_tokens` index), like the byte-level path's added matcher —
-    /// repeated `str::find` per token costs ~8% of encode on long inputs.
-    /// Set by `finalize_speed_paths`.
+    /// Leftmost-longest automaton over `added_tokens` (pattern index == vec
+    /// index).
     pub(crate) added_matcher: Option<aho_corasick::AhoCorasick>,
-    /// Frequent ASCII punctuation to split units *before* (0 = unused slot):
-    /// units like "▁word," otherwise explode the distinct-unit space (and
-    /// the pretoken cache) with word×punctuation combinations. Set by
-    /// `finalize_speed_paths`.
+    /// Frequent ASCII punctuation to split units before (0 = unused slot),
+    /// keeping word×punctuation combinations out of the cache.
     pub(crate) split_bytes: [u8; NUM_SPLIT_BYTES],
-    /// Indexed by the split byte, a bitset over the previous byte for when
-    /// the split is safe — exactly the predecessors that never appear
-    /// immediately before that byte inside any vocab piece, so no merge can
-    /// span the boundary. Empty (all zeros) for non-split bytes.
+    /// Per split byte, a bitset over the previous byte for when the split
+    /// is safe (no vocab piece contains the pair, so no merge spans it).
     pub(crate) split_safe: Vec<[u64; 4]>,
-    /// Decompositions of the vocab pieces that can cross a `▁▁▁word` unit
-    /// boundary, as `(pre, post)` around one interior ▁ — e.g. gemma's
-    /// `>▁</` yields `(">", "</")`. Under `SpaceRuns` the scanner skips a
-    /// split exactly where such a piece occurs spanning the candidate
-    /// boundary (a merge result is always a contiguous vocab piece, so
-    /// every other boundary is provably safe). Set by
-    /// `finalize_speed_paths`; empty under `EveryMark`/`None`.
+    /// Vocab pieces that can cross a `▁▁▁word` unit boundary, as `(pre,
+    /// post)` around one interior ▁; see `piece_spans_boundary`.
     pub(crate) cross_pieces: Vec<(Box<[u8]>, Box<[u8]>)>,
-    /// Bitset over the byte just before a candidate boundary (the last byte
-    /// of some `cross_pieces` pre) for a one-load rejection in the scanner.
+    /// Bitset over the last byte of any `cross_pieces` pre, for a one-load
+    /// rejection in the scanner.
     pub(crate) cross_prev: [u64; 4],
     /// Cache budget snapshot by each [`Self::encoder`]; `None` = unbounded.
     pub(crate) max_cache_bytes: Option<usize>,
@@ -315,6 +292,50 @@ impl std::fmt::Debug for SentencePieceBPE {
 }
 
 impl SentencePieceBPE {
+    /// Assemble a model from its loaded tables; `norm_added_tokens` are
+    /// given raw and normalized here. Derived fast-path state is computed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        merges: RankedMerges,
+        vocab: Vec<Arc<[u8]>>,
+        vocab_inv: HashMap<Arc<[u8]>, TokenId, FxBuildHasher>,
+        byte_fallback_ids: [Option<TokenId>; 256],
+        added_tokens: Vec<AddedTokenSpec>,
+        norm_added_tokens: Vec<AddedTokenSpec>,
+        norm_ops: Vec<NormOp>,
+        metaspace: Option<Metaspace>,
+    ) -> Self {
+        let mut model = Self {
+            merges,
+            vocab,
+            vocab_inv,
+            byte_fallback_ids,
+            added_tokens,
+            norm_added_tokens: Vec::new(),
+            norm_ops,
+            metaspace,
+            word_split: WordSplit::None,
+            raw_prepend: None,
+            space_init: Vec::new(),
+            ascii_init: [None; 128],
+            added_matcher: None,
+            split_bytes: [0; NUM_SPLIT_BYTES],
+            split_safe: Vec::new(),
+            cross_pieces: Vec::new(),
+            cross_prev: [0; 4],
+            max_cache_bytes: Some(crate::bpe::Tokenizer::DEFAULT_MAX_CACHE_BYTES),
+        };
+        model.norm_added_tokens = norm_added_tokens
+            .into_iter()
+            .map(|mut spec| {
+                spec.content = model.apply_norm_ops(&spec.content).into_owned();
+                spec
+            })
+            .collect();
+        model.finalize_speed_paths();
+        model
+    }
+
     /// Apply the normalizer ops and Metaspace replacement/prepend to one text
     /// chunk. `first_chunk` is true only for the chunk at the very start of
     /// the input (the Metaspace "first" prepend scheme needs it).
@@ -376,11 +397,7 @@ impl SentencePieceBPE {
         let mut s = input;
         if let Some(ms) = &self.metaspace {
             if s.contains(' ') {
-                let replaced: String = s
-                    .chars()
-                    .map(|c| if c == ' ' { SENTENCEPIECE_SPACE } else { c })
-                    .collect();
-                s = Cow::Owned(replaced);
+                s = Cow::Owned(s.replace(' ', SENTENCEPIECE_SPACE_STR));
             }
             let prepend = match ms.prepend {
                 PrependScheme::Always => true,
@@ -432,11 +449,8 @@ impl SentencePieceBPE {
         self.added_matcher = (!self.added_tokens.is_empty()).then(|| {
             aho_corasick::AhoCorasick::builder()
                 .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                // The scan visits every input byte; a DFA's one lookup per
-                // byte beats the contiguous NFA noticeably when the added
-                // vocabulary is large (gemma-3 carries 6.4k added tokens,
-                // and the scan was ~23% of its encode profile). Prefix
-                // sharing (<unusedNNNN>…) keeps the table small.
+                // DFA: the scan visits every byte; large added vocabs need
+                // O(1)/byte.
                 .kind(Some(aho_corasick::AhoCorasickKind::DFA))
                 .build(self.added_tokens.iter().map(|t| t.content.as_bytes()))
                 .expect("added-token automaton")
@@ -494,15 +508,11 @@ impl SentencePieceBPE {
         }
     }
 
-    /// The vocab pieces that can cross a `▁▁▁word`-shaped unit boundary — a
-    /// unit starts at each ▁ following a non-▁ char, so a piece crosses
-    /// exactly when it contains such an interior ▁ — decomposed as
-    /// `(pre, post)` around that ▁. `Some(vec![])` means units are
-    /// unconditionally safe (per-unit BPE equals global BPE); a non-empty
-    /// list means safe with the scanner's occurrence guard; `None` means a
-    /// crossing piece is too complex for the guard's byte-compare (a ▁ or a
-    /// raw space inside `pre`/`post`, whose raw-mode text form varies) or
-    /// there are too many, so whole-chunk merging must stay.
+    /// Vocab pieces that can cross a `▁▁▁word` unit boundary (an interior ▁
+    /// after a non-▁ char), as `(pre, post)`. `Some(vec![])`: units are
+    /// unconditionally safe; `None`: a piece is too complex for the guard
+    /// (a ▁ or raw space inside pre/post) or there are too many, so
+    /// whole-chunk merging must stay.
     fn unit_crossing_pieces(&self) -> Option<Vec<(Box<[u8]>, Box<[u8]>)>> {
         // Beyond this the per-boundary guard stops being "a handful of
         // memcmps on a rare prev byte" and whole-chunk merging is safer.
@@ -556,47 +566,31 @@ impl SentencePieceBPE {
             .any(|(pre, post)| bytes[..mark_pos].ends_with(pre) && after.starts_with(post))
     }
 
-    /// Whether an oversized document can be split into fragments that encode
-    /// independently with token-identical output (see
-    /// [`Self::safe_fragment_ranges`]). Requires the raw fast path: its
-    /// per-unit encoding is what makes a provable unit boundary a safe cut.
-    /// The materialized-normalizer path applies whole-section ops (Strip
-    /// trims section edges, charsmaps span graphemes, Prepend re-fires per
-    /// section), so no interior cut has a local safety argument there — and
-    /// `WordSplit::None` merges whole chunks, so nothing can be split at all.
+    /// Whether an oversized document can be split into independently
+    /// encoded fragments (see [`Self::safe_fragment_ranges`]). Only the raw
+    /// fast path encodes per unit, so only there is a unit boundary a safe
+    /// cut.
     pub(crate) fn supports_fragment_split(&self) -> bool {
         self.raw_prepend.is_some()
     }
 
     /// Split raw text into ranges of roughly `target` bytes at cuts the raw
     /// scanner provably treats as unit boundaries, so encoding the first
-    /// range with `encode_raw_cb` and each later one with
-    /// `encode_raw_fragment_cb` and concatenating the token streams is
-    /// identical to encoding `text` in one call. Only valid when
-    /// [`Self::supports_fragment_split`] holds.
+    /// range with `encode_raw_cb` and the rest with
+    /// `encode_raw_fragment_cb` equals one encode of `text`. Requires
+    /// [`Self::supports_fragment_split`].
     ///
-    /// A cut at `p` is safe when the serial scan is guaranteed to close a
-    /// unit exactly at `p` and every decision it makes is local to one side:
-    ///
-    /// - `p` starts a mark — a raw space, or a complete ▁ (0xE2 always
-    ///   leads a 3-byte char in valid UTF-8, so neither test can misread a
-    ///   continuation byte) — and, under `SpaceRuns`, does not extend a
-    ///   mark run (the char before it is not a mark) and no crossing vocab
-    ///   piece occurrence spans it (`piece_spans_boundary`). The scanner's
-    ///   remaining decisions cannot reach across `p`: a crossing piece's
-    ///   `pre`/`post` contain no space or ▁ (see `unit_crossing_pieces`),
-    ///   so no occurrence of one can span the mark at `p`; mark-run state
-    ///   resets at every non-mark char; and the punctuation split test
-    ///   reads one preceding byte.
-    /// - No added-token occurrence blocks `p` (see
-    ///   `added_token_cut_blocks`): leftmost-longest matching carries no
-    ///   state across an occurrence-free point, so restarting it at `p`
-    ///   reproduces the single-pass matches, and lstrip/rstrip whitespace
+    /// A cut at `p` is safe when:
+    /// - `p` starts a mark (raw space or complete ▁) that, under
+    ///   `SpaceRuns`, neither extends a mark run nor has a crossing piece
+    ///   spanning it (`piece_spans_boundary`); every other scanner decision
+    ///   is local to one side.
+    /// - no added-token occurrence blocks `p` (`added_token_cut_blocks`), so
+    ///   leftmost-longest matching restarts cleanly and lstrip/rstrip
     ///   trimming stays within one fragment.
     ///
-    /// Where no safe cut exists the scan keeps probing forward, so a range
-    /// can exceed `target` (in the worst case it is the rest of the
-    /// document — output stays exact, only parallelism degrades).
+    /// Where no safe cut exists a range can exceed `target` (output stays
+    /// exact, only parallelism degrades).
     pub(crate) fn safe_fragment_ranges(
         &self,
         text: &str,
@@ -649,35 +643,18 @@ impl SentencePieceBPE {
     }
 
     /// Sorted, disjoint byte intervals in which no fragment cut may land,
-    /// derived from added-token occurrences. Every occurrence is collected,
-    /// overlapping ones included — a superset of the matches an encode
-    /// selects, which is what makes the blocking conservative and exact:
+    /// from every added-token occurrence (overlapping ones included: a
+    /// conservative superset of the matches an encode selects):
+    /// - inside an occurrence `[s, e)`;
+    /// - at `e` itself, under `Unguarded` prepend only (the continuation
+    ///   section would go un-prefixed);
+    /// - `lstrip`: back through the whitespace run before `s`;
+    /// - `rstrip`: forward through the whitespace run after `e`.
     ///
-    /// - inside an occurrence `[s, e)`: the cut halves would BPE-encode as
-    ///   plain text (and truncation could change leftmost-longest choices);
-    /// - at `e` itself, under `Unguarded` prepend only: the fragment's
-    ///   continuation section would go un-prefixed where the serial encode
-    ///   ▁-prefixes the post-match section it opens at `e`. (Guarded
-    ///   schemes skip the prefix on the cut's own mark either way, and both
-    ///   sides then scan the identical section from `e`.);
-    /// - `lstrip`: back through the whitespace run before `s`, whose
-    ///   trimming would otherwise reach into the previous fragment;
-    /// - `rstrip`: forward through the whitespace run after `e`, which the
-    ///   serial match consumes.
-    ///
-    /// A cut only ever lands on a mark start (a space or ▁'s 0xE2 lead), so
-    /// an occurrence's interior can hold one only when its content carries
-    /// such a byte. A token without one, without lstrip/rstrip, on a
-    /// non-`Unguarded` model therefore cannot block anything and is skipped
-    /// without a scan — gemma-3 carries 6.4k added tokens, and one pass per
-    /// token over a multi-hundred-MB document is seconds, not milliseconds.
-    ///
-    /// The surviving tokens' scans are independent and run on the rayon
-    /// pool: gemma keeps 30 ▁-run tokens, and their ~9 GB of memmem over a
-    /// 290 MB document was ~35% of the whole parallel encode when run
-    /// serially. Only the parallel encode entry points fragment documents,
-    /// so touching rayon here is safe (the fork-safe `_serial` paths never
-    /// reach this).
+    /// A cut only lands on a mark start, so a token without a space or ▁
+    /// byte, without lstrip/rstrip, on a non-`Unguarded` model cannot block
+    /// anything and is skipped without a scan. The scans run on the rayon
+    /// pool; only the parallel entry points fragment documents.
     fn added_token_cut_blocks(&self, text: &str) -> Vec<std::ops::Range<usize>> {
         use rayon::prelude::*;
         let bytes = text.as_bytes();
@@ -796,22 +773,15 @@ impl SentencePieceBPE {
 
     /// Merge rules as `(left, right)` byte pairs in rank order.
     pub fn merge_entries(&self) -> Vec<(&[u8], &[u8])> {
-        let mut ranked: Vec<_> = self.merges.iter().collect();
-        ranked.sort_unstable_by_key(|&(_, &(_, rank))| rank);
-        ranked
-            .into_iter()
-            .map(|(&key, _)| {
-                (
-                    self.vocab[(key >> 32) as usize].as_ref(),
-                    self.vocab[(key & u32::MAX as u64) as usize].as_ref(),
-                )
-            })
-            .collect()
+        super::ranked_merge_entries(&self.merges, &self.vocab)
     }
 
-    /// Convenience: encode a single text (creates a temporary encoder).
+    /// Convenience: encode a single text through a temporary encoder.
     pub fn encode_raw(&self, input: &str) -> Vec<TokenId> {
-        self.encoder().encode_raw(input)
+        let mut out = Vec::new();
+        self.encoder()
+            .encode_raw_cb(input, &mut |tokens| out.extend_from_slice(tokens));
+        out
     }
 
     /// Decode token IDs back to a UTF-8 string.
@@ -861,11 +831,7 @@ fn collapse_space_runs(input: &str, content: &str) -> String {
     out
 }
 
-/// Per-thread mutable encoding context: the pretoken cache plus scratch
-/// buffers, mirroring the byte-level BPE path's memoization. Units repeat
-/// heavily in natural text, so the ranked merge only runs on cache misses.
-/// log2 of the direct-mapped front-cache size (entries). 2^20 keeps the
-/// Zipf-hot working set resident despite eviction churn from tail units.
+/// log2 of the direct-mapped front-cache size (entries).
 const FRONT_BITS: u32 = 20;
 
 /// Fixed footprint of the front cache (keys + vals), subtracted from the
@@ -873,8 +839,7 @@ const FRONT_BITS: u32 = 20;
 const FRONT_BYTES: usize = (1 << FRONT_BITS) * (16 + 8);
 /// Estimated bytes per map entry, payload + SwissTable slack (`long` adds
 /// its key bytes on top). Length-based, because the wipe keeps allocations.
-const SHORT_ENTRY_BYTES: usize = 48;
-const LONG_ENTRY_BYTES: usize = 48;
+const MAP_ENTRY_BYTES: usize = 48;
 
 /// Index of `key` in the front cache: multiplicative hash, top bits.
 #[inline(always)]
@@ -884,15 +849,15 @@ fn front_index(key: u128) -> usize {
     (h >> (64 - FRONT_BITS)) as usize
 }
 
+/// Per-thread mutable encoding context: the unit cache plus scratch
+/// buffers. Units repeat heavily in natural text, so the ranked merge only
+/// runs on cache misses.
 pub struct EncodeState {
     /// Append-only arena of encoded token IDs; cache entries are
     /// `(offset, len)` slices into it.
     arena: Vec<TokenId>,
-    /// Direct-mapped front cache in front of `short`, split
-    /// structure-of-arrays so a probe touches only the 16 MB key array
-    /// (values load on hit). Zipf-hot units resolve here with one compare
-    /// instead of a SwissTable probe into a couple-hundred-MB map. Key 0 =
-    /// empty (packed keys always carry a nonzero length tag).
+    /// Direct-mapped front cache in front of `short`, structure-of-arrays
+    /// so a probe touches only the key array. Key 0 = empty.
     front_keys: Vec<u128>,
     front_vals: Vec<(u32, u32)>,
     /// Cache for units of ≤ 15 key bytes (the overwhelming majority), keyed
@@ -907,7 +872,7 @@ pub struct EncodeState {
     /// Byte budget for the growing caches ([`Self::with_budget`]);
     /// `usize::MAX` = unbounded.
     budget: usize,
-    /// Estimated `long` bytes: key bytes + [`LONG_ENTRY_BYTES`] per entry.
+    /// Estimated `long` bytes: key bytes + `MAP_ENTRY_BYTES` per entry.
     long_bytes_used: usize,
     /// Largest single encoding, as wipe-trigger slack: one recurring giant
     /// unit must not force a wipe per occurrence. Kept across wipes.
@@ -915,10 +880,6 @@ pub struct EncodeState {
 }
 
 impl EncodeState {
-    pub fn new() -> Self {
-        Self::with_budget(Some(super::Tokenizer::DEFAULT_MAX_CACHE_BYTES))
-    }
-
     /// A state whose growing caches (short/long maps + arena; the front
     /// cache is fixed-size) wipe back to empty when their estimated
     /// footprint exceeds `max_bytes` minus the front cache, floored at
@@ -944,9 +905,8 @@ impl EncodeState {
         self.short.len() + self.long.len()
     }
 
-    #[inline]
     fn over_budget(&self) -> bool {
-        self.short.len() * SHORT_ENTRY_BYTES + self.long_bytes_used + self.arena.len() * 4
+        self.short.len() * MAP_ENTRY_BYTES + self.long_bytes_used + self.arena.len() * 4
             > self.budget.saturating_add(self.max_encoding * 4)
     }
 
@@ -965,7 +925,7 @@ impl EncodeState {
 
 impl Default for EncodeState {
     fn default() -> Self {
-        Self::new()
+        Self::with_budget(Some(super::Tokenizer::DEFAULT_MAX_CACHE_BYTES))
     }
 }
 
@@ -976,40 +936,72 @@ pub struct Encoder<'a> {
     state: EncodeState,
 }
 
-/// Leftmost match of any spec's content in `text`; ties go to the longest
-/// content, like HF's aho-corasick LeftmostLongest added-token matching.
-fn find_added_token<'s>(
-    specs: &'s [AddedTokenSpec],
-    text: &str,
-) -> Option<(usize, &'s AddedTokenSpec)> {
-    let mut best: Option<(usize, &AddedTokenSpec)> = None;
-    for spec in specs {
+/// Leftmost match of any spec's content in `text` (longest on ties, like
+/// HF's LeftmostLongest matching), as `(position, spec index)`.
+fn find_added_token(specs: &[AddedTokenSpec], text: &str) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, spec) in specs.iter().enumerate() {
         if let Some(pos) = text.find(spec.content.as_str()) {
             let better = match best {
                 None => true,
-                Some((best_pos, best_spec)) => {
+                Some((best_pos, best_i)) => {
                     pos < best_pos
-                        || (pos == best_pos && spec.content.len() > best_spec.content.len())
+                        || (pos == best_pos && spec.content.len() > specs[best_i].content.len())
                 }
             };
             if better {
-                best = Some((pos, spec));
+                best = Some((pos, i));
             }
         }
     }
     best
 }
 
-impl<'a> Encoder<'a> {
-    /// Encode raw (un-normalized) text with added-token splitting.
-    pub fn encode_raw(&mut self, input: &str) -> Vec<TokenId> {
-        let mut result = Vec::new();
-        self.model
-            .encode_raw_with(&mut self.state, input, &mut result);
-        result
-    }
+/// One piece of an added-token split: text between matches, or a matched
+/// token's ID.
+enum Piece<'t> {
+    Section(&'t str),
+    Token(TokenId),
+}
 
-    /// Like [`Self::encode_raw`], emitting token runs through `f`.
+/// Split `text` around added-token `matches` (`(start, end, spec index)`,
+/// leftmost-longest, in order) with lstrip/rstrip, like HF's
+/// AddedVocabulary: a match starting inside whitespace a previous rstrip
+/// consumed is dropped.
+fn split_added<'t>(
+    specs: &[AddedTokenSpec],
+    text: &'t str,
+    matches: impl Iterator<Item = (usize, usize, usize)>,
+    mut emit: impl FnMut(Piece<'t>),
+) {
+    let mut chunk_start = 0usize;
+    for (start, end, idx) in matches {
+        if start < chunk_start {
+            continue;
+        }
+        let spec = &specs[idx];
+        let mut chunk = &text[chunk_start..start];
+        if spec.lstrip {
+            chunk = chunk.trim_end();
+        }
+        if !chunk.is_empty() {
+            emit(Piece::Section(chunk));
+        }
+        emit(Piece::Token(spec.id));
+        chunk_start = end;
+        if spec.rstrip {
+            chunk_start += text[end..].len() - text[end..].trim_start().len();
+        }
+    }
+    let chunk = &text[chunk_start..];
+    if !chunk.is_empty() {
+        emit(Piece::Section(chunk));
+    }
+}
+
+impl<'a> Encoder<'a> {
+    /// Encode raw (un-normalized) text with added-token splitting, emitting
+    /// token runs through `f`.
     pub fn encode_raw_cb<F: FnMut(&[TokenId])>(&mut self, input: &str, f: &mut F) {
         self.model.encode_raw_cb(&mut self.state, input, f);
     }
@@ -1049,14 +1041,6 @@ fn mark_width(bytes: &[u8], pos: usize, raw: bool) -> Option<usize> {
 }
 
 impl SentencePieceBPE {
-    /// Encode raw (un-normalized) text into a token buffer. See
-    /// [`Self::encode_raw_cb`].
-    pub fn encode_raw_with(&self, state: &mut EncodeState, input: &str, out: &mut Vec<TokenId>) {
-        self.encode_raw_cb(state, input, &mut |tokens: &[TokenId]| {
-            out.extend_from_slice(tokens)
-        });
-    }
-
     /// Encode raw (un-normalized) text with added-token splitting: first the
     /// raw-matched (`normalized: false`) tokens, then — per remaining section —
     /// the normalizer ops, the normalized-matched tokens, and Metaspace + BPE.
@@ -1087,36 +1071,17 @@ impl SentencePieceBPE {
             self.encode_section_cb(state, input, start, f);
             return;
         };
-
-        // Iterate leftmost-longest added-token matches; the text between
-        // consecutive matches forms the chunks. lstrip/rstrip consume the
-        // whitespace adjacent to a match.
-        let mut chunk_start = 0usize;
         let mut pos = start;
-        for m in matcher.find_iter(input.as_bytes()) {
-            let spec = &self.added_tokens[m.pattern().as_usize()];
-            if m.start() < chunk_start {
-                // Swallowed by the previous match's rstrip.
-                continue;
+        let matches = matcher
+            .find_iter(input.as_bytes())
+            .map(|m| (m.start(), m.end(), m.pattern().as_usize()));
+        split_added(&self.added_tokens, input, matches, |piece| match piece {
+            Piece::Section(chunk) => self.encode_section_cb(state, chunk, pos, f),
+            Piece::Token(id) => {
+                f(&[id]);
+                pos = SectionPos::Middle;
             }
-            let mut chunk = &input[chunk_start..m.start()];
-            if spec.lstrip {
-                chunk = chunk.trim_end();
-            }
-            if !chunk.is_empty() {
-                self.encode_section_cb(state, chunk, pos, f);
-            }
-            f(&[spec.id]);
-            chunk_start = m.end();
-            if spec.rstrip {
-                chunk_start += input[chunk_start..].len() - input[chunk_start..].trim_start().len();
-            }
-            pos = SectionPos::Middle;
-        }
-        let chunk = &input[chunk_start..];
-        if !chunk.is_empty() {
-            self.encode_section_cb(state, chunk, pos, f);
-        }
+        });
     }
 
     /// Encode one raw section: the raw fast path when eligible, otherwise
@@ -1149,35 +1114,25 @@ impl SentencePieceBPE {
             return;
         }
 
-        let mut remaining: &str = &normed;
+        let specs = &self.norm_added_tokens;
         let mut first = first_chunk;
-        while !remaining.is_empty() {
-            match find_added_token(&self.norm_added_tokens, remaining) {
-                Some((pos, spec)) => {
-                    let part = if spec.lstrip {
-                        remaining[..pos].trim_end()
-                    } else {
-                        &remaining[..pos]
-                    };
-                    if !part.is_empty() {
-                        let final_text = self.apply_metaspace(Cow::Borrowed(part), first);
-                        self.encode_normalized_cb(state, &final_text, f);
-                    }
-                    f(&[spec.id]);
-                    let mut rest = &remaining[pos + spec.content.len()..];
-                    if spec.rstrip {
-                        rest = rest.trim_start();
-                    }
-                    remaining = rest;
-                    first = false;
-                }
-                None => {
-                    let final_text = self.apply_metaspace(Cow::Borrowed(remaining), first);
-                    self.encode_normalized_cb(state, &final_text, f);
-                    break;
-                }
+        let mut from = 0usize;
+        let matches = std::iter::from_fn(|| {
+            let (pos, idx) = find_added_token(specs, &normed[from..])?;
+            let start = from + pos;
+            from = start + specs[idx].content.len();
+            Some((start, from, idx))
+        });
+        split_added(specs, &normed, matches, |piece| match piece {
+            Piece::Section(part) => {
+                let final_text = self.apply_metaspace(Cow::Borrowed(part), first);
+                self.encode_normalized_cb(state, &final_text, f);
             }
-        }
+            Piece::Token(id) => {
+                f(&[id]);
+                first = false;
+            }
+        });
     }
 
     /// Raw fast path: split un-normalized text into units directly, mapping
@@ -1206,7 +1161,7 @@ impl SentencePieceBPE {
             RawPrepend::GuardedFirst => pos == SectionPos::First && !starts_with_mark,
             RawPrepend::Never => false,
         };
-        self.encode_units(state, bytes, virtual_prefix, true, f);
+        self.encode_units::<true, F>(state, bytes, virtual_prefix, f);
     }
 
     /// Encode already-normalized text: unit split (per `word_split`) with the
@@ -1219,35 +1174,15 @@ impl SentencePieceBPE {
     ) {
         match self.word_split {
             WordSplit::None => self.bpe_chunk(state, input, f),
-            _ => self.encode_units(state, input.as_bytes(), false, false, f),
+            _ => self.encode_units::<false, F>(state, input.as_bytes(), false, f),
         }
     }
 
-    /// Split a chunk into word units and encode each through the cache.
-    ///
-    /// `raw` selects raw-mode marks (space or ▁) vs normalized-mode marks
-    /// (▁ only); `virtual_prefix` logically prepends one space to the first
-    /// unit (the raw fast path's dummy prefix).
-    fn encode_units<F: FnMut(&[TokenId])>(
-        &self,
-        state: &mut EncodeState,
-        bytes: &[u8],
-        virtual_prefix: bool,
-        raw: bool,
-        f: &mut F,
-    ) {
-        if raw {
-            self.encode_units_impl::<true, F>(state, bytes, virtual_prefix, f);
-        } else {
-            self.encode_units_impl::<false, F>(state, bytes, virtual_prefix, f);
-        }
-    }
-
-    /// Walk 32-byte SIMD blocks whose mark-candidate bitmask is drained bit
-    /// by bit, closing a unit at each qualifying mark. Candidates are dense
-    /// in natural text (~1 per 5 bytes), so the block mask is kept in a
-    /// register and the per-candidate hot path is a couple of bit ops.
-    fn encode_units_impl<const RAW: bool, F: FnMut(&[TokenId])>(
+    /// Split a chunk into word units and encode each through the cache,
+    /// walking 32-byte SIMD blocks whose mark-candidate bitmask is drained
+    /// bit by bit. `RAW` selects raw-mode marks (space or ▁) vs ▁ only;
+    /// `virtual_prefix` logically prepends one space to the first unit.
+    fn encode_units<const RAW: bool, F: FnMut(&[TokenId])>(
         &self,
         state: &mut EncodeState,
         bytes: &[u8],
@@ -1260,6 +1195,21 @@ impl SentencePieceBPE {
         let mut unit_start = 0usize;
         let mut last_mark_end = usize::MAX;
         let mut first_unit = true;
+        // Close the current unit at `end` and start the next one there.
+        macro_rules! close_unit {
+            ($end:expr) => {{
+                let end = $end;
+                self.encode_unit(
+                    state,
+                    &bytes[unit_start..end],
+                    virtual_prefix && first_unit,
+                    RAW,
+                    f,
+                );
+                first_unit = false;
+                unit_start = end;
+            }};
+        }
 
         let splats = self.split_bytes.map(u8x16::splat);
 
@@ -1296,30 +1246,18 @@ impl SentencePieceBPE {
                 mask &= mask - 1;
                 let byte = bytes[mark_pos];
                 if (RAW && byte == b' ') || byte == 0xE2 {
-                    // A candidate is only a mark if it's a space (raw mode)
-                    // or a full ▁ (0xE2 also starts other three-byte chars;
-                    // its continuation bytes are never candidates).
+                    // 0xE2 also starts other three-byte chars.
                     let Some(width) = mark_width(bytes, mark_pos, RAW) else {
                         continue;
                     };
-                    // SpaceRuns: only a mark that doesn't extend a run
-                    // starts a unit — and not where a crossing vocab piece
-                    // spans the boundary (`cross_prev` is all-zero when
-                    // there are none, so the guard is one load + test).
+                    // SpaceRuns: a mark that extends a run, or one a crossing
+                    // vocab piece spans, is not a boundary.
                     let boundary = every_mark || mark_pos != last_mark_end;
                     if boundary
                         && mark_pos != unit_start
                         && !self.piece_spans_boundary(bytes, mark_pos, width)
                     {
-                        self.encode_unit(
-                            state,
-                            &bytes[unit_start..mark_pos],
-                            virtual_prefix && first_unit,
-                            RAW,
-                            f,
-                        );
-                        first_unit = false;
-                        unit_start = mark_pos;
+                        close_unit!(mark_pos);
                     }
                     last_mark_end = mark_pos + width;
                 } else if mark_pos != unit_start {
@@ -1332,15 +1270,7 @@ impl SentencePieceBPE {
                     }
                     let safe = &self.split_safe[byte as usize];
                     if safe[(prev >> 6) as usize] & (1 << (prev & 63)) != 0 {
-                        self.encode_unit(
-                            state,
-                            &bytes[unit_start..mark_pos],
-                            virtual_prefix && first_unit,
-                            RAW,
-                            f,
-                        );
-                        first_unit = false;
-                        unit_start = mark_pos;
+                        close_unit!(mark_pos);
                     }
                 }
             }
@@ -1349,13 +1279,7 @@ impl SentencePieceBPE {
         // `unit_start` only ever advances to a mark position < len, so a
         // non-empty chunk always has a final unit.
         if unit_start < bytes.len() {
-            self.encode_unit(
-                state,
-                &bytes[unit_start..],
-                virtual_prefix && first_unit,
-                RAW,
-                f,
-            );
+            close_unit!(bytes.len());
         }
     }
 
@@ -1407,9 +1331,7 @@ impl SentencePieceBPE {
                 state.front_vals[front_idx] = (offset, len);
             }
             let start = offset as usize;
-            // SAFETY: every cached (offset, len) was recorded right after
-            // appending those `len` tokens at `offset`; the arena only
-            // clears in a budget wipe, which also clears both maps.
+            // SAFETY: as above (a wipe also clears both maps).
             f(unsafe { state.arena.get_unchecked(start..start + len as usize) });
             return;
         }
@@ -1446,7 +1368,7 @@ impl SentencePieceBPE {
                 } else {
                     unit.into()
                 };
-                state.long_bytes_used += key.len() + LONG_ENTRY_BYTES;
+                state.long_bytes_used += key.len() + MAP_ENTRY_BYTES;
                 state.long.insert(key, (offset, len));
             }
         }
@@ -1497,53 +1419,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_precompiled_fast_scan_matches_grapheme_walk() {
-        // The SIMD clean-run scan must reproduce normalize_string exactly,
-        // including CRLF pairs, control chars, combining marks that extend an
-        // ASCII cluster, and non-ASCII spans with ASCII margins.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/data/fineweb_4096_bpe_tokenizer.json"
-        );
-        if !std::path::Path::new(path).exists() {
-            eprintln!("Skipping: {path} not found");
-            return;
-        }
-        let tok = crate::load_tokenizer::hf::load_hf_sentencepiece(path).unwrap();
-        let charsmap = tok
-            .norm_ops
-            .iter()
-            .find_map(|op| match op {
-                NormOp::Precompiled(c) => Some(c),
-                _ => None,
-            })
-            .expect("fineweb model has a precompiled charsmap");
-        let cases = [
-            "plain ascii text",
-            "tabs\tand\r\nnewlines\rmixed\x07controls\x00",
-            "combining: a\u{301} e\u{308} at end x\u{300}",
-            "ﬁligature ½ ㎒ Ⅷ ｆｕｌｌｗｉｄｔｈ",
-            "mixed日本語and ascii, ünïcode wörds",
-            "\u{200b}zero width start",
-            "trailing non-ascii é",
-            "é",
-            "",
-            "\r",
-            "\r\n",
-            "a\r\nb",
-        ];
-        for case in cases {
-            let mut fast = String::new();
-            charsmap.normalize_into(case, &mut fast);
-            assert_eq!(
-                fast,
-                charsmap.pre.normalize_string(case),
-                "fast path diverged for {case:?}"
-            );
-        }
-    }
-
-    #[test]
     fn test_collapse_space_runs() {
         assert_eq!(collapse_space_runs("a  b   c d  ", "▁"), "a▁b▁c d▁");
         assert_eq!(collapse_space_runs("a \t  b", "▁"), "a \t▁b");
@@ -1591,13 +1466,13 @@ mod tests {
 
         let mut unbounded = EncodeState::with_budget(None);
         let mut expected = Vec::new();
-        model.encode_raw_with(&mut unbounded, &text, &mut expected);
+        model.encode_raw_cb(&mut unbounded, &text, &mut |t| expected.extend_from_slice(t));
 
         // 25 MiB total = ~1 MiB effective past the 24 MiB front cache:
         // several wipes over ~100k distinct units.
         let mut budgeted = EncodeState::with_budget(Some(25 << 20));
         let mut actual = Vec::new();
-        model.encode_raw_with(&mut budgeted, &text, &mut actual);
+        model.encode_raw_cb(&mut budgeted, &text, &mut |t| actual.extend_from_slice(t));
         assert_eq!(actual, expected, "budgeted output diverged");
         assert!(budgeted.long_bytes_used > 0, "corpus never hit the long map");
         // Both saw ~100k distinct units, so a small survivor count proves
@@ -1608,7 +1483,7 @@ mod tests {
             budgeted.cache_size(),
             unbounded.cache_size()
         );
-        let used = budgeted.short.len() * SHORT_ENTRY_BYTES
+        let used = budgeted.short.len() * MAP_ENTRY_BYTES
             + budgeted.long_bytes_used
             + budgeted.arena.len() * 4;
         let limit = budgeted.budget + budgeted.max_encoding * 4;

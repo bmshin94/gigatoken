@@ -12,12 +12,9 @@
 //!
 //! A single left-to-right pass reproduces the hierarchy by treating number
 //! chars and CJK-range chars as hard piece boundaries for the main regex:
-//! no match may cross one, and the `(?!\S)` lookahead succeeds at a
-//! boundary exactly as it does at end of input (so a whitespace run ending
-//! at a digit stays whole). Within a CJK piece the main regex still runs —
-//! the ranges contain a few non-letters (U+309B/U+309C voicing marks are
-//! `\p{S}`, U+30A0/U+30FB are `\p{P}`, U+3040 etc. are unassigned) — with
-//! the piece edges as the region bounds. Each scan therefore carries a
+//! no match may cross one, and `(?!\S)` succeeds at a boundary as at end of
+//! input. The main regex still runs inside a CJK piece (the ranges contain
+//! a few `\p{P}`/`\p{S}`/unassigned chars), so every scan carries a
 //! `cjk_region` flag: a char belongs to the current region iff
 //! `is_deepseek_cjk(cp) == cjk_region`.
 
@@ -391,7 +388,7 @@ fn advance_pos(bytes: &[u8], pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use crate::pretokenize::fast::test_support::*;
 
     /// The three Split regexes verbatim (no possessive quantifiers, so they
     /// run directly under fancy-regex).
@@ -435,15 +432,13 @@ mod tests {
         pieces.into_iter().map(str::to_owned).collect()
     }
 
-    fn fast_tokens(s: &str) -> Vec<String> {
-        FastDeepSeekV3Pretokenizer::new(s.as_bytes())
-            .map(|t| String::from_utf8_lossy(t.0).into_owned())
-            .collect()
+    fn fast(s: &str) -> Vec<String> {
+        fast_tokens(FastDeepSeekV3Pretokenizer::new(s.as_bytes()))
     }
 
     #[test]
     fn deepseek_small_cases() {
-        let cases = [
+        let cases = &[
             "hello",
             " hello",
             "hello world",
@@ -526,20 +521,13 @@ mod tests {
             "<|endoftext|>",
             "https://example.com/path?q=1",
         ];
-        for case in cases {
-            assert_eq!(
-                fast_tokens(case),
-                reference_tokens(case),
-                "Mismatch on case {case:?}"
-            );
-        }
+        assert_cases(cases, fast, reference_tokens);
     }
 
     /// Random codepoint soup drawn from classes the scheme distinguishes,
     /// compared against the composed reference regexes.
     #[test]
     fn deepseek_matches_regex_random() {
-        use rand::prelude::*;
         let pools: &[&[char]] = &[
             &['a', 'Z', 'é', 'ß', 'Ж', 'ا', '한'],           // letters
             &['1', '9', '٢', '½', 'Ⅷ', '๕'],                // numbers
@@ -550,46 +538,14 @@ mod tests {
             &['一', '龥', 'あ', 'ゟ', '゠', 'ヿ', '゛', '\u{3040}', '・', 'ー'], // CJK ranges
             &['丂', '日', '本', 'カ', 'な'],                  // more CJK
         ];
-        let mut rng = StdRng::seed_from_u64(0xDEE9_5EEC);
-        for round in 0..2000 {
-            let len = rng.random_range(1..40);
-            let s: String = (0..len)
-                .map(|_| {
-                    let pool = pools.choose(&mut rng).unwrap();
-                    *pool.choose(&mut rng).unwrap()
-                })
-                .collect();
-            assert_eq!(
-                fast_tokens(&s),
-                reference_tokens(&s),
-                "Mismatch on round {round}, case {s:?}"
-            );
-        }
-    }
-
-    /// Load the first `max_bytes` of ~/data/owt_train.txt, truncated to a
-    /// UTF-8 boundary (streamed; the full file is ~12 GB).
-    fn load_owt_prefix(max_bytes: usize) -> Vec<u8> {
-        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
-        let f = std::fs::File::open(&path).expect("Could not open ~/data/owt_train.txt");
-        let mut buf = Vec::with_capacity(max_bytes);
-        f.take(max_bytes as u64).read_to_end(&mut buf).unwrap();
-        while !buf.is_empty() && std::str::from_utf8(&buf).is_err() {
-            buf.pop();
-        }
-        buf
+        assert_random_soup(pools, 0xDEE9_5EEC, 2000, fast, reference_tokens);
     }
 
     #[test]
     fn deepseek_matches_regex_owt() {
-        const SIZE: usize = 5_000_000;
-        let input = load_owt_prefix(SIZE);
+        let input = load_owt_prefix(5_000_000);
         let text = std::str::from_utf8(&input).unwrap();
-        eprintln!(
-            "Testing deepseek fast pretokenizer vs composed regexes on {:.1} MB of OWT",
-            input.len() as f64 / 1e6
-        );
-        let fast: Vec<String> = fast_tokens(text);
+        let fast: Vec<String> = fast(text);
         let reference = reference_tokens(text);
         for (i, (f, r)) in fast.iter().zip(reference.iter()).enumerate() {
             assert_eq!(

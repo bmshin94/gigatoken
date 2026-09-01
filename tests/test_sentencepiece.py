@@ -288,3 +288,35 @@ def test_model_path_routing(sp4096_spm_path):
 def test_from_sentencepiece_rejects_non_bpe():
     with pytest.raises(ValueError, match="sentencepiece"):
         Tokenizer.from_sentencepiece(b"\x00\x01not a real model")
+
+
+# ---------------------------------------------------------------------------
+# Precompiled charsmap: the SIMD clean-run scan vs HF's grapheme walk
+# ---------------------------------------------------------------------------
+
+PRECOMPILED_CASES = [
+    "plain ascii text",
+    "tabs\tand\r\nnewlines\rmixed\x07controls\x00",
+    "combining: á ë at end x̀",
+    "ﬁligature ½ ㎒ Ⅷ ｆｕｌｌｗｉｄｔｈ",
+    "mixed日本語and ascii, ünïcode wörds",
+    "​zero width start",
+    "trailing non-ascii é",
+    "é",
+    "",
+    "\r",
+    "\r\n",
+    "a\r\nb",
+]
+
+
+def test_sp4096_precompiled_fast_scan(sp4096_spm_path):
+    """sp4096 carries an nmt_nfkc precompiled charsmap: the ASCII fast scan
+    around it must agree with HF's per-grapheme walk on CRLF pairs, control
+    chars, combining marks extending an ASCII cluster, and non-ASCII spans
+    with ASCII margins."""
+    from gigatoken._load.sentencepiece import sentencepiece_to_tokenizer_json
+
+    hf_tok = HFTokenizer.from_str(sentencepiece_to_tokenizer_json(sp4096_spm_path.read_bytes()))
+    gigatoken_tok = Tokenizer.from_sentencepiece(sp4096_spm_path)
+    _assert_parity(hf_tok, gigatoken_tok, PRECOMPILED_CASES)

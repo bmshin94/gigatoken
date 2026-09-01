@@ -1,5 +1,3 @@
-//! Once we have a document, we can pretokenize it (potentially in parallel)
-
 use std::ops::Deref;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]

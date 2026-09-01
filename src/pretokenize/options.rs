@@ -28,44 +28,70 @@ const DEEPSEEK_V3_SPLIT_REGEXES: [&str; 3] = [
     "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
 ];
 
-impl PretokenizerType {
-    /// Fast pretokenizer for this scheme.
-    ///
-    /// The returned enum dispatches once per token; for hot loops over a
-    /// known scheme, use the concrete iterator types directly.
-    #[inline]
-    pub fn pretokenize<'a>(&self, bytes: &'a [u8]) -> FastPretokenizerDispatch<'a> {
-        match self {
-            PretokenizerType::GPT2 => {
-                FastPretokenizerDispatch::R50k(FastR50kPretokenizer::new(bytes))
-            }
-            PretokenizerType::GPT4 => {
-                FastPretokenizerDispatch::Cl100k(FastCl100kPretokenizer::new(bytes))
-            }
-            PretokenizerType::Qwen2 => {
-                FastPretokenizerDispatch::Qwen2(FastQwen2Pretokenizer::new(bytes))
-            }
-            PretokenizerType::Qwen35 => {
-                FastPretokenizerDispatch::Qwen35(FastQwen35Pretokenizer::new(bytes))
-            }
-            PretokenizerType::Olmo3 => {
-                FastPretokenizerDispatch::Olmo3(FastOlmo3Pretokenizer::new(bytes))
-            }
-            PretokenizerType::DeepSeekV3 => {
-                FastPretokenizerDispatch::DeepSeekV3(FastDeepSeekV3Pretokenizer::new(bytes))
-            }
-            PretokenizerType::O200k => {
-                FastPretokenizerDispatch::O200k(FastO200kPretokenizer::new(bytes))
-            }
-            PretokenizerType::Nemotron => {
-                FastPretokenizerDispatch::Nemotron(FastNemotronPretokenizer::new(bytes))
-            }
-            PretokenizerType::Kimi => {
-                FastPretokenizerDispatch::Kimi(FastKimiPretokenizer::new(bytes))
+/// One row per scheme: `PretokenizerType` variant, `FastPretokenizerDispatch`
+/// variant, concrete pretokenizer type.
+macro_rules! dispatch {
+    ($( $scheme:ident => $variant:ident($fast:ident) ),* $(,)?) => {
+        impl PretokenizerType {
+            /// Fast pretokenizer for this scheme.
+            ///
+            /// The returned enum dispatches once per token; for hot loops over a
+            /// known scheme, use the concrete iterator types directly.
+            #[inline]
+            pub fn pretokenize<'a>(&self, bytes: &'a [u8]) -> FastPretokenizerDispatch<'a> {
+                match self {
+                    $( PretokenizerType::$scheme => FastPretokenizerDispatch::$variant($fast::new(bytes)), )*
+                }
             }
         }
-    }
 
+        /// Runtime-selected fast pretokenizer, one variant per scheme.
+        pub enum FastPretokenizerDispatch<'a> {
+            $( $variant($fast<'a>), )*
+        }
+
+        impl<'a> Iterator for FastPretokenizerDispatch<'a> {
+            type Item = Pretoken<'a>;
+
+            #[inline]
+            fn next(&mut self) -> Option<Pretoken<'a>> {
+                match self {
+                    $( FastPretokenizerDispatch::$variant(it) => it.next(), )*
+                }
+            }
+        }
+
+        // SAFETY: pure delegation to the concrete pretokenizers'
+        // (contract-upholding) fills; no entries are written here.
+        unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispatch<'a> {
+            /// One dispatch per chunk instead of one per pretoken.
+            #[inline]
+            fn fill_spans_keyed(
+                &mut self,
+                batch: &mut crate::pretokenize::SpanBatch<'a>,
+                prefetch: &impl Fn(u64),
+            ) -> usize {
+                match self {
+                    $( FastPretokenizerDispatch::$variant(it) => it.fill_spans_keyed(batch, prefetch), )*
+                }
+            }
+        }
+    };
+}
+
+dispatch! {
+    GPT2 => R50k(FastR50kPretokenizer),
+    GPT4 => Cl100k(FastCl100kPretokenizer),
+    Qwen2 => Qwen2(FastQwen2Pretokenizer),
+    Qwen35 => Qwen35(FastQwen35Pretokenizer),
+    Olmo3 => Olmo3(FastOlmo3Pretokenizer),
+    DeepSeekV3 => DeepSeekV3(FastDeepSeekV3Pretokenizer),
+    O200k => O200k(FastO200kPretokenizer),
+    Nemotron => Nemotron(FastNemotronPretokenizer),
+    Kimi => Kimi(FastKimiPretokenizer),
+}
+
+impl PretokenizerType {
     /// The canonical name of each variant, in variant order — the
     /// identifiers `from_name` accepts (plus the aliases listed there).
     /// Error messages naming the valid schemes derive from this list.
@@ -141,63 +167,3 @@ impl PretokenizerType {
         }
     }
 }
-
-/// Runtime-selected fast pretokenizer; add a variant here when implementing
-/// a new scheme under `fast`.
-pub enum FastPretokenizerDispatch<'a> {
-    R50k(FastR50kPretokenizer<'a>),
-    Cl100k(FastCl100kPretokenizer<'a>),
-    Qwen2(FastQwen2Pretokenizer<'a>),
-    Qwen35(FastQwen35Pretokenizer<'a>),
-    Olmo3(FastOlmo3Pretokenizer<'a>),
-    DeepSeekV3(FastDeepSeekV3Pretokenizer<'a>),
-    O200k(FastO200kPretokenizer<'a>),
-    Nemotron(FastNemotronPretokenizer<'a>),
-    Kimi(FastKimiPretokenizer<'a>),
-}
-
-impl<'a> Iterator for FastPretokenizerDispatch<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        match self {
-            FastPretokenizerDispatch::R50k(it) => it.next(),
-            FastPretokenizerDispatch::Cl100k(it) => it.next(),
-            FastPretokenizerDispatch::Qwen2(it) => it.next(),
-            FastPretokenizerDispatch::Qwen35(it) => it.next(),
-            FastPretokenizerDispatch::Olmo3(it) => it.next(),
-            FastPretokenizerDispatch::DeepSeekV3(it) => it.next(),
-            FastPretokenizerDispatch::O200k(it) => it.next(),
-            FastPretokenizerDispatch::Nemotron(it) => it.next(),
-            FastPretokenizerDispatch::Kimi(it) => it.next(),
-        }
-    }
-}
-
-// SAFETY: pure delegation to the concrete pretokenizers' (contract-upholding)
-// fills; no entries are written here.
-unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispatch<'a> {
-    /// One dispatch per chunk instead of one per pretoken, delegating to
-    /// the concrete pretokenizers' fused chunk fills.
-    #[inline]
-    fn fill_spans_keyed(
-        &mut self,
-        batch: &mut crate::pretokenize::SpanBatch<'a>,
-        prefetch: &impl Fn(u64),
-    ) -> usize {
-        use crate::pretokenize::PretokenSpans;
-        match self {
-            FastPretokenizerDispatch::R50k(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::Cl100k(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::Qwen2(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::Qwen35(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::Olmo3(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::DeepSeekV3(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::O200k(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::Nemotron(it) => it.fill_spans_keyed(batch, prefetch),
-            FastPretokenizerDispatch::Kimi(it) => it.fill_spans_keyed(batch, prefetch),
-        }
-    }
-}
-

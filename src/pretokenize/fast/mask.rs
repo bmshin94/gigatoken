@@ -1,52 +1,25 @@
 //! Shared infrastructure for mask-scanner pretokenizers.
 //!
-//! A mask-scanner pretokenizer processes 64-byte batches: SIMD classifies
-//! every byte, bitmask algebra derives "a token starts here" bits, and
-//! `next()` pops one bit per token — no per-token dispatch branches, which
-//! is what makes it ~2x the serial scalar scanners (see
-//! pretokenizer_optimization_log.md step 15).
-//!
-//! A scheme plugs in two functions ([`MaskScheme`]):
-//! - `advance`: the scalar ground truth (also the no-SIMD iterator),
-//! - `batch_masks`: `(usable, bad)` bitmasks for a 64-byte batch. `usable`
-//!   bits are trustworthy token starts; `bad` marks zones (non-ASCII the
-//!   scheme doesn't classify in-mask, batch-edge ambiguities) that
-//!   [`MaskState`] re-derives through `advance`, never emitting a token
-//!   across an unresolved zone.
-//!
-//! Layering, bottom to top:
-//! 1. Platform SIMD primitives (`movemask64`, `ascii_masks` on NEON;
-//!    `ascii_masks_avx512` / `ascii_masks_avx2` on x86-64) — the only
-//!    per-platform code.
-//! 2. Bit-domain helpers shared across schemes — platform-independent
-//!    u64 algebra and per-char table classification
-//!    (`classify_uni_chars`, `char_through`, `nn_at_full`,
-//!    `digit_run_splits3`), parameterized by each scheme's codepoint
-//!    classifier.
-//! 3. Per-scheme `batch_masks` boundary algebra (in the scheme's module).
-//! 4. [`MaskState`] — the scheme-agnostic batch walker: segments, bad-zone
-//!    gaps, scalar tail, one-batch-ahead precompute; scalar overruns stay
-//!    on the 64-byte grid so the precompute survives them.
-//! 5. [`MaskState::fill_spans_two_phase`] — the chunked pull the encode
-//!    loop uses: the same masks and trust rules as `next_span`, but
-//!    harvested a chunk at a time into a flat boundary buffer and emitted
-//!    in a branch-free counted loop.
+//! A mask scanner classifies 64-byte batches with SIMD into per-byte u64
+//! class masks, derives "a token starts here" bits with shifted-mask
+//! algebra, and pops one bit per token. A scheme plugs in two hooks
+//! ([`MaskScheme`]): `advance`, the scalar ground truth (also the no-SIMD
+//! path), and `batch_masks`, the `(usable, bad)` bits of one batch, where
+//! `bad` marks zones the walker re-derives through `advance`. [`MaskState`]
+//! is the scheme-agnostic walker behind `Iterator::next`;
+//! [`MaskState::fill_spans_two_phase`] is the chunked pull the encode loop
+//! uses (same masks, harvested a chunk at a time and emitted branch-free).
 
 use crate::pretokenize::unicode::{self, CharClass};
 
-// -----------------------------------------------------------------------
-// Platform SIMD primitives: aarch64 NEON (compile-time, always present)
-// and x86_64 AVX-512 or AVX2 (runtime-detected; scalar fallback
-// otherwise).
-// -----------------------------------------------------------------------
+// Platform SIMD primitives: aarch64 NEON (always present), x86_64 AVX-512 or
+// AVX2 (runtime-detected; scalar fallback otherwise).
 
-/// Does this x86_64 CPU have the full AVX-512 tier (Zen 4/5, Ice
-/// Lake+)? Schemes dispatch their batch classifier on this: the AVX-512
-/// front-end when true, the AVX2 one otherwise.
+/// Does this x86_64 CPU have the AVX-512 scanner tier (Zen 4/5, Ice Lake+)?
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn avx512_scanner_available() -> bool {
-    // std's feature cache makes this an atomic load + bit test after the
+    // std caches the CPUID result: an atomic load + bit test after the
     // first call.
     std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
@@ -57,21 +30,16 @@ pub(crate) fn avx512_scanner_available() -> bool {
         && std::arch::is_x86_feature_detected!("popcnt")
 }
 
-/// Does this x86_64 CPU also have AVX-512 VBMI2 (native 512-bit
-/// `vpcompressb`: Zen 4/5, Ice Lake+ — i.e. nearly every AVX-512 CPU,
-/// but the bit is detected, not assumed: Skylake-X lacks it and stays on
-/// the plain AVX-512 tier)? Gates the `X86_TIER_AVX512_VBMI2` fill tier
-/// ([`MaskState::fill_spans_two_phase`]'s `_avx512_vbmi2_crc` wrapper),
-/// whose `flatten_bits_avx512` needs VBMI2 on top of the scanner tier.
+/// The AVX-512 scanner tier plus VBMI2 (`vpcompressb` for
+/// [`flatten_bits_avx512`]); Skylake-X lacks it and stays on the plain tier.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn avx512_fill_available() -> bool {
     avx512_scanner_available() && std::arch::is_x86_feature_detected!("avx512vbmi2")
 }
 
-/// Does this x86_64 CPU have the AVX2 tier (Haswell+, all Zen)? The bit
-/// features (BMI1/2, LZCNT, POPCNT) arrived with or before AVX2 on every
-/// AVX2 CPU, but are detected explicitly since the boundary algebra's
+/// Does this x86_64 CPU have the AVX2 scanner tier (Haswell+, all Zen)?
+/// The bit features are detected explicitly since the boundary algebra's
 /// codegen relies on them.
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -83,9 +51,7 @@ pub(crate) fn avx2_scanner_available() -> bool {
         && std::arch::is_x86_feature_detected!("popcnt")
 }
 
-/// Is the SIMD mask scanner usable on this machine? aarch64 always has
-/// NEON; x86_64 requires AVX-512 (Zen 4/5, Ice Lake+) or AVX2 (Haswell+,
-/// Zen 1-3), detected at runtime. When this returns false, [`MaskState`]
+/// Is a SIMD mask scanner usable on this machine? When false, [`MaskState`]
 /// runs every token through the scheme's scalar `advance`.
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -99,14 +65,9 @@ pub(crate) fn simd_scanner_available() -> bool {
     cfg!(target_arch = "aarch64")
 }
 
-// The x86-64 batch classifiers are annotated
-// `#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]`
-// (AVX-512 tier) or `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]`
-// (AVX2 tier). Besides the wide byte ops, the scalar-visible bit features
-// (BMI1/2, LZCNT, POPCNT) are enabled so the boundary algebra inlined
-// into those functions compiles to tzcnt/lzcnt/blsr instead of
-// baseline-x86 bsf sequences. The sets must stay in sync with
-// [`avx512_scanner_available`] / [`avx2_scanner_available`].
+// The x86-64 `target_feature` sets below enable the bit features (BMI1/2,
+// LZCNT, POPCNT) too, so inlined boundary algebra gets tzcnt/lzcnt/blsr;
+// they must stay in sync with the `*_scanner_available` checks.
 
 /// simdjson-style movemask: 4 mask vectors (64 lanes of 0x00/0xFF) -> u64,
 /// bit i = lane i.
@@ -126,15 +87,9 @@ pub(crate) unsafe fn movemask64(
         let a1 = vandq_u8(v1, w);
         let mut a2 = vandq_u8(v2, w);
         let a3 = vandq_u8(v3, w);
-        // The 4-`addp` reduction tree (simdjson's arm64 movemask), pinned
-        // as asm. Written with `vpaddq_u8`, LLVM rewrites every pairwise
-        // add into a uzp1/uzp2/orr triple — adjacent weighted lanes have
-        // disjoint bits, so add == or, and the canonical or-form never
-        // re-forms addp — inflating each call from 9 to 17 vector ops
-        // (4-7 calls per 64-byte batch across the schemes). The weighted
-        // `and`s stay outside so the scheduler still interleaves
-        // neighboring calls. `addp(x, x)` lane 0..7 equals the old
-        // `addp(x, zero)` lanes 0..7; only lane u64 0 is read.
+        // simdjson's 4-`addp` reduction tree, pinned as asm: written with
+        // `vpaddq_u8`, LLVM rewrites the adds as uzp/orr triples (9 -> 17
+        // ops per call). Only lane u64 0 is read.
         core::arch::asm!(
             "addp {a0:v}.16b, {a0:v}.16b, {a1:v}.16b",
             "addp {a2:v}.16b, {a2:v}.16b, {a3:v}.16b",
@@ -171,59 +126,9 @@ pub(crate) struct AsciiMasks {
     pub ap: u64,
 }
 
-/// Classify `bytes[scan..scan+64]` (requires `scan + 64 <= bytes.len()`).
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub(crate) fn ascii_masks(bytes: &[u8], scan: usize) -> AsciiMasks {
-    use std::arch::aarch64::*;
-    unsafe {
-        let p = bytes.as_ptr().add(scan);
-        let mut l = [vdupq_n_u8(0); 4];
-        let mut d = [vdupq_n_u8(0); 4];
-        let mut s = [vdupq_n_u8(0); 4];
-        let mut wt = [vdupq_n_u8(0); 4];
-        let mut n = [vdupq_n_u8(0); 4];
-        let mut hi = [vdupq_n_u8(0); 4];
-        let mut ap = [vdupq_n_u8(0); 4];
-        for i in 0..4 {
-            let v = vld1q_u8(p.add(16 * i));
-            let lowered = vorrq_u8(v, vdupq_n_u8(0x20));
-            l[i] = vcleq_u8(vsubq_u8(lowered, vdupq_n_u8(b'a')), vdupq_n_u8(25));
-            d[i] = vcleq_u8(vsubq_u8(v, vdupq_n_u8(b'0')), vdupq_n_u8(9));
-            s[i] = vceqq_u8(v, vdupq_n_u8(b' '));
-            n[i] = vorrq_u8(
-                vceqq_u8(v, vdupq_n_u8(b'\r')),
-                vceqq_u8(v, vdupq_n_u8(b'\n')),
-            );
-            // \t (9), \x0b (11), \x0c (12): ascii ws minus \r\n and space.
-            wt[i] = vbicq_u8(
-                vcleq_u8(vsubq_u8(v, vdupq_n_u8(9)), vdupq_n_u8(4)),
-                n[i],
-            );
-            hi[i] = vcltzq_s8(vreinterpretq_s8_u8(v));
-            ap[i] = vceqq_u8(v, vdupq_n_u8(b'\''));
-        }
-        AsciiMasks {
-            l: movemask64(l[0], l[1], l[2], l[3]),
-            d: movemask64(d[0], d[1], d[2], d[3]),
-            s: movemask64(s[0], s[1], s[2], s[3]),
-            wt: movemask64(wt[0], wt[1], wt[2], wt[3]),
-            n: movemask64(n[0], n[1], n[2], n[3]),
-            hi: movemask64(hi[0], hi[1], hi[2], hi[3]),
-            ap: movemask64(ap[0], ap[1], ap[2], ap[3]),
-        }
-    }
-}
-
 /// Classify `bytes[scan..scan+64]` with AVX-512 (requires
-/// `scan + 64 <= bytes.len()`). One 64-byte load and one k-register
-/// compare per predicate: a `__mmask64` IS the u64 the bit algebra wants,
-/// so there is no movemask ladder and no lazy any-tests — every field
-/// (including `hi` and `ap`) is computed unconditionally.
-///
-/// Runtime-gated: callers reach this only after
-/// [`simd_scanner_available`] reported AVX-512 support (enforced by
-/// [`MaskState`], which otherwise never leaves the scalar path).
+/// `scan + 64 <= bytes.len()` and a detected AVX-512 tier). One k-register
+/// compare per predicate: a `__mmask64` IS the u64 the algebra wants.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
@@ -255,25 +160,12 @@ pub(crate) fn ascii_masks_avx512(bytes: &[u8], scan: usize) -> AsciiMasks {
 }
 
 /// Classify `bytes[scan..scan+64]` with AVX2 (requires
-/// `scan + 64 <= bytes.len()`). Two 32-byte loads; each predicate is one
-/// vector compare per half plus a `vpmovmskb` ladder into the u64 the bit
-/// algebra wants — more mask-extraction traffic than the AVX-512 version
-/// (whose k-register compares ARE the u64s), but the output currency is
-/// identical, so everything downstream is shared. AVX2 has no unsigned
-/// byte compare; `x <= lim` is `min_epu8(x, lim) == x`.
-///
-/// Runtime-gated: callers reach this only after
-/// [`avx2_scanner_available`] reported AVX2 support (enforced by the
-/// schemes' dispatch, behind [`MaskState`]'s `simd_scanner_available`
-/// gate).
+/// `scan + 64 <= bytes.len()` and a detected AVX2 tier): one compare per
+/// half plus a `vpmovmskb` ladder (`x <= lim` is `min_epu8(x, lim) == x`).
 ///
 /// `#[inline(never)]` is load-bearing: inlined, LLVM's vector combiner
-/// sees the compare vectors behind the returned u64s and pulls the
-/// caller's scalar boundary algebra back into the byte-vector domain,
-/// expanding every mask<->vector crossing into vpinsrb/vpextrb ladders
-/// (~240 byte ops per batch, measured 3.5x slower end to end on Zen 2).
-/// The AVX-512 tier has no such domain to return to (k-register compares
-/// ARE the u64s), so it stays inline.
+/// pulls the caller's scalar boundary algebra back into the byte-vector
+/// domain (vpinsrb/vpextrb ladders, measured 3.5x slower end to end).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline(never)]
@@ -327,19 +219,16 @@ pub(crate) fn ascii_masks_avx2(bytes: &[u8], scan: usize) -> AsciiMasks {
     }
 }
 
-// -----------------------------------------------------------------------
 // Bit-domain helpers (platform-independent)
-// -----------------------------------------------------------------------
 
 /// Is the char starting at `idx` NOT whitespace (`\S` for a `(?!\S)`
-/// lookahead)? Full answer via the packed table.
+/// lookahead)?
 ///
 /// # Safety
 ///
-/// `idx < bytes.len()`, and when `bytes[idx]` is non-ASCII,
-/// `idx + 4 <= bytes.len()` (the guardless [`decode_cp_inbounds`] read).
-/// The batch classifiers' `scan + 70 <= len` guard covers every call
-/// site's worst case (`idx = scan + 64`).
+/// `idx < bytes.len()`, and `idx + 4 <= bytes.len()` when `bytes[idx]` is
+/// non-ASCII (the batch classifiers' `scan + 70 <= len` guard covers
+/// `idx = scan + 64`).
 #[inline(always)]
 pub(crate) unsafe fn nn_at_full(bytes: &[u8], idx: usize) -> bool {
     use super::{decode_cp_inbounds, is_ascii_ws};
@@ -353,22 +242,17 @@ pub(crate) unsafe fn nn_at_full(bytes: &[u8], idx: usize) -> bool {
     unicode::class_of(cp) != CharClass::Whitespace
 }
 
-/// The char containing byte `pos - 1` (`pos > 0`, valid UTF-8): its
-/// class, lead index, and end (exclusive). `end > pos` iff the char
-/// straddles across `pos`. ASCII classifies with the byte predicates;
-/// multi-byte chars walk back to their lead (at most 3 bytes) and use
-/// the packed table — this is what lets a batch after a unicode char
-/// compute true boundary carries instead of deferring to a bad zone.
-/// `class`: the scheme's codepoint classifier (`unicode::class_of`, or a
-/// mark-folding view like `unicode::class_of_marks_join`).
+/// The char containing byte `pos - 1`: its class (per the scheme's
+/// codepoint classifier `class`), lead index, and end (exclusive); `end >
+/// pos` iff the char straddles across `pos`. Multi-byte chars walk back
+/// to their lead, which is what lets a batch after a unicode char compute
+/// true carries instead of a bad zone.
 ///
 /// # Safety
 ///
-/// `pos > 0`, and when `bytes[pos - 1]` is non-ASCII,
-/// `pos + 3 <= bytes.len()`: the walk-back lead `j` satisfies
-/// `j <= pos - 1`, so the guardless [`decode_cp_inbounds`] read needs
-/// `j + 4 <= pos + 3` in-bounds bytes. The batch classifiers' `scan + 70
-/// <= len` guard covers every call site (`pos <= scan + 64`).
+/// `pos > 0`, and `pos + 3 <= bytes.len()` when `bytes[pos - 1]` is
+/// non-ASCII (the walk-back lead `j <= pos - 1` is decoded guardless; the
+/// batch classifiers' `scan + 70 <= len` guard covers `pos <= scan + 64`).
 #[inline(always)]
 pub(crate) unsafe fn char_through(
     bytes: &[u8],
@@ -432,27 +316,19 @@ pub(crate) struct UniClasses {
     pub resid: u64,
 }
 
-/// Classify every unicode char whose lead bit is in `m` (typically
-/// `hi & !claimed-straddle-in-bytes`) for `bytes[scan..scan+64]`.
-/// A char spilling off the batch end is classified via the lookahead
-/// bytes; only its in-batch bytes get class bits, and the next
-/// batch's `char_through` walk-back covers the remainder. `NUMBERS`:
-/// false for schemes whose digit grouping is char-counted (`\p{N}{1,3}`
-/// byte masks can't express multi-byte chars), true otherwise.
-/// `LEADS`: whether to fill the per-length lead masks (only schemes with
-/// a shift-by-prev-char-length rule need them).
+/// Classify every unicode char whose lead bit is in `m` for
+/// `bytes[scan..scan+64]`. A char spilling off the batch end gets class
+/// bits for its in-batch bytes only (the next batch's `char_through`
+/// walk-back covers the rest). `NUMBERS`: false when digit grouping is
+/// char-counted (`\p{N}{1,3}`), so number chars defer. `LEADS`: fill the
+/// per-length lead masks (for shift-by-prev-char-length rules).
 ///
-/// The loop stays branchy on purpose: a branchless csel-selected
-/// decode/classify body measured 0.986x (predicted branches beat data
-/// chains, log step 13/17). 2-byte chars (nearly all non-ASCII in western
-/// corpora) take a dedicated lane with an inline decode; 3/4-byte chars
-/// pay the general ladder.
+/// The loop stays branchy on purpose (a branchless body measured 0.986x).
 ///
 /// # Safety
 ///
-/// `scan + 70 <= bytes.len()` (the batch classifiers' lookahead guard):
-/// a lead bit at position 63 puts the guardless [`decode_cp_inbounds`]
-/// read at `scan + 63`, which may touch through `scan + 67`.
+/// `scan + 70 <= bytes.len()`: a lead at bit 63 is decoded guardless and
+/// may touch through `scan + 67`.
 #[inline(always)]
 pub(crate) unsafe fn classify_uni_chars<const NUMBERS: bool, const LEADS: bool>(
     bytes: &[u8],
@@ -566,9 +442,22 @@ pub(crate) fn digit_run_splits3(d: u64) -> u64 {
     b
 }
 
-// -----------------------------------------------------------------------
+/// Smear `seed` upward (toward higher bits) through contiguous set bits of
+/// `within`, in log steps.
+#[inline(always)]
+pub(crate) fn smear_up(seed: u64, within: u64) -> u64 {
+    let mut a = seed;
+    let mut m = within;
+    let mut sh = 1u32;
+    while sh < 64 {
+        a |= (a << sh) & m;
+        m &= m << sh;
+        sh <<= 1;
+    }
+    a
+}
+
 // The batch walker
-// -----------------------------------------------------------------------
 
 /// The two per-scheme hooks of a mask-scanner pretokenizer.
 pub(crate) trait MaskScheme {
@@ -583,29 +472,21 @@ pub(crate) trait MaskScheme {
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64);
 
     /// The x86_64 batch classifier, monomorphized on the SIMD tier
-    /// (`AVX512` = true → the AVX-512 front-end, false → AVX2); same
-    /// `(usable, bad)` contract as the aarch64 `batch_masks`. The fill
-    /// wrappers instantiate this inside a matching `#[target_feature]`
-    /// region, so the tier function inlines into the fill loop and no
-    /// per-batch dispatch survives (the codegen a `-C target-cpu=native`
-    /// build gets).
+    /// (`AVX512`: the AVX-512 front-end, else AVX2); same contract as the
+    /// aarch64 `batch_masks`. The fill wrappers instantiate it inside a
+    /// matching `#[target_feature]` region so it inlines into the fill loop.
     ///
     /// # Safety
     ///
-    /// The selected tier must have been runtime-detected:
-    /// [`avx512_scanner_available`] for `AVX512` = true,
-    /// [`avx2_scanner_available`] for `AVX512` = false.
+    /// The selected tier must have been runtime-detected
+    /// ([`avx512_scanner_available`] / [`avx2_scanner_available`]).
     #[cfg(target_arch = "x86_64")]
     unsafe fn batch_masks_x86<const AVX512: bool>(bytes: &[u8], scan: usize) -> (u64, u64);
 
-    /// Runtime-dispatched form of [`Self::batch_masks_x86`] for call
-    /// sites outside a tier-monomorphized region (`next_span`): a cached
-    /// tier check plus a non-inlined call per batch into a per-tier
-    /// `#[target_feature]` wrapper ([`batch_masks_dyn_avx512`] /
-    /// [`batch_masks_dyn_avx2`]), so the classifier body still compiles
-    /// under the full tier feature set. Must only be called when
-    /// [`simd_scanner_available`] is true — [`MaskState`] guarantees this
-    /// by never leaving the scalar path otherwise.
+    /// Runtime-dispatched form of [`Self::batch_masks_x86`] for call sites
+    /// outside a tier-monomorphized region (`next_span`): a cached tier
+    /// check plus a call into a per-tier `#[target_feature]` wrapper. Only
+    /// valid when [`simd_scanner_available`] ([`MaskState`] guarantees it).
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64)
@@ -613,9 +494,6 @@ pub(crate) trait MaskScheme {
         Self: Sized,
     {
         debug_assert!(simd_scanner_available());
-        // The tier check is a cached atomic load + bit test and the
-        // branch is perfectly predicted, so it is noise next to the
-        // batch classification it selects.
         if avx512_scanner_available() {
             // SAFETY: runtime AVX-512 detection right above.
             unsafe { batch_masks_dyn_avx512::<Self>(bytes, scan) }
@@ -629,12 +507,8 @@ pub(crate) trait MaskScheme {
 }
 
 /// AVX-512 feature region for the runtime-dispatched
-/// `MaskScheme::batch_masks`: the scheme's `#[inline(always)]`
-/// `batch_masks_x86` body fuses into this wrapper, so the per-batch call
-/// `next_span` pays runs full-tier codegen (without this region the body
-/// would inline into the plain-feature caller, where the inner
-/// `#[target_feature]` mask classifiers can't inline and the boundary
-/// algebra loses BMI/LZCNT codegen — measured ~25% slower).
+/// `MaskScheme::batch_masks`: the scheme's `batch_masks_x86` body fuses
+/// into it and gets full-tier codegen (~25% slower without this region).
 ///
 /// # Safety
 ///
@@ -662,14 +536,11 @@ unsafe fn batch_masks_dyn_avx2<S: MaskScheme>(bytes: &[u8], scan: usize) -> (u64
     unsafe { S::batch_masks_x86::<false>(bytes, scan) }
 }
 
-/// x86 SIMD-tier selector for the monomorphized fill bodies
-/// ([`MaskState::fill_spans_two_phase_impl`]): `DYN` keeps the per-batch
-/// runtime dispatch of the provided `MaskScheme::batch_masks`; `AVX2` /
-/// `AVX512` pin the tier, chosen once per fill inside a matching
-/// `#[target_feature]` wrapper. `AVX512_VBMI2` is the AVX-512 tier plus
-/// VBMI2 ([`avx512_fill_available`]): same batch classifiers, but phase
-/// A's flatten runs `vpcompressb` (`flatten_bits_avx512`) — its only
-/// divergence. Meaningless (and always `DYN`) off x86_64.
+/// x86 SIMD-tier selector for the monomorphized fill bodies: `DYN` keeps
+/// the per-batch runtime dispatch, the others pin the tier once per fill
+/// inside a matching `#[target_feature]` wrapper (`AVX512_VBMI2` differs
+/// from `AVX512` only in phase A's `vpcompressb` flatten). Always `DYN`
+/// off x86_64.
 pub(crate) const X86_TIER_DYN: u8 = 0;
 pub(crate) const X86_TIER_AVX2: u8 = 1;
 pub(crate) const X86_TIER_AVX512: u8 = 2;
@@ -780,17 +651,9 @@ impl MaskState {
                     continue;
                 }
                 self.batch_bad = 0;
-                // Resume after a scalar overrun WITHOUT leaving the
-                // 64-byte grid: the precomputed next batch (and the
-                // prefetch chain behind it) stays valid, where rebasing
-                // to the token boundary invalidated it on every bad-zone
-                // overrun — a large part of a deferral's ~800-cycle
-                // cost. Grid bits below `pos` may be stale run-internal
-                // bits (a ws or digit run the scalar walked through can
-                // cross the grid base); they are masked by the
-                // `from_bit` passed to load_segment below, and every
-                // path that puts `pos` inside such a run goes through a
-                // deferral first, so those bits are never trusted.
+                // Resume after a scalar overrun WITHOUT leaving the 64-byte
+                // grid, so the precomputed next batch stays valid; stale
+                // run-internal bits below `pos` are masked by `from_bit`.
                 while self.scan + 64 <= self.pos {
                     self.scan += 64;
                 }
@@ -808,14 +671,9 @@ impl MaskState {
                 self.scan += 64;
                 self.batch_usable = usable;
                 self.batch_bad = bad;
-                // Kick off the next batch now; its SIMD chain overlaps this
-                // batch's pops instead of stalling the next refill. Also
-                // done for dirty batches: a scalar overrun past the batch
-                // end just leaves the precompute unused (`pre_base` misses),
-                // while gaps that resolve inside the batch — the common
-                // case — keep the pipeline primed. Dirty batches used to
-                // skip this, and paying the whole SIMD chain latency at the
-                // next refill was a large part of their ~270-cycle cost.
+                // Kick off the next batch now (dirty batches too): its SIMD
+                // chain overlaps this batch's pops instead of stalling the
+                // next refill.
                 if self.scan + 64 <= len {
                     let (u2, b2) = S::batch_masks(bytes, self.scan);
                     self.pre_base = self.scan;
@@ -844,9 +702,7 @@ impl MaskState {
     }
 }
 
-// -----------------------------------------------------------------------
 // Two-phase chunked span fill
-// -----------------------------------------------------------------------
 
 /// Set-bit positions of a byte, packed in 8 u16 lanes (unused lanes 0,
 /// never read). 4 KB, L1-resident alongside the unicode class table.
@@ -871,13 +727,24 @@ static BIT_POS: [[u16; 8]; 256] = {
 
 /// Append the set-bit positions of `m`, offset by `rel` (wrapping), to
 /// `out[0..popcount]` with no data-dependent branch: 8 fixed iterations,
-/// one unconditional 8-lane store each at that octet's exclusive-prefix
-/// popcount, so 64 bits cost the same straight-line code regardless of
-/// population. Scribbles up to `out[popcount + 7]`; callers reserve the
-/// slack. Returns the popcount.
+/// one unconditional 8-lane store each, so 64 bits cost the same
+/// regardless of population. Scribbles up to `out[popcount + 7]`
+/// (`out[0..128]` on the VBMI2 tier); callers reserve the slack. Returns
+/// the popcount.
+///
+/// # Safety
+///
+/// The scribble range must be writable; with `X86_TIER =
+/// X86_TIER_AVX512_VBMI2` the CPU must support AVX-512 F/BW/VBMI2 (that
+/// instantiation lives only inside the `_avx512_vbmi2_crc` wrapper).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-unsafe fn flatten_bits(m: u64, rel: u16, out: *mut u16) -> usize {
+unsafe fn flatten_bits<const X86_TIER: u8>(m: u64, rel: u16, out: *mut u16) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if X86_TIER == X86_TIER_AVX512_VBMI2 {
+        // SAFETY: forwarded from this fn's contract.
+        return unsafe { flatten_bits_avx512(m, rel, out) };
+    }
     // Per-octet popcounts (SWAR); one multiply turns them into inclusive
     // prefix sums, and a byte shift makes them exclusive write offsets —
     // the 8 stores below are mutually independent.
@@ -915,19 +782,13 @@ unsafe fn flatten_bits(m: u64, rel: u16, out: *mut u16) -> usize {
 }
 
 /// [`flatten_bits`] via AVX-512 VBMI2: `vpcompressb` packs the set-bit
-/// positions of `m` (as compressed iota-byte lanes) in one op, replacing
-/// the 8-octet BIT_POS LUT walk (~3.8% of warm cycles on Zen 5,
-/// profiling/zen5_st_profile.md §5.5). Widen both halves to u16, add the
-/// broadcast `rel` (wrapping, as the scalar version), two unconditional
-/// 64-byte stores. Scribbles `out[0..128]` regardless of popcount — a
-/// wider scribble than the scalar version's `out[popcount + 7]`; BOUND_BUF
-/// reserves the 128-lane slack past every call site's worst-case cursor.
+/// positions in one op, widened to u16 plus `rel`, two unconditional
+/// 64-byte stores (scribbles `out[0..128]` regardless of popcount).
 ///
 /// # Safety
 ///
-/// The CPU must support AVX-512 F/BW/VBMI2 (reached only from the
-/// `fill_spans_two_phase_avx512_vbmi2_crc` wrapper, gated on
-/// [`avx512_fill_available`]), and `out[0..128]` must be writable.
+/// The CPU must support AVX-512 F/BW/VBMI2 and `out[0..128]` must be
+/// writable.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2")]
 #[inline]
@@ -957,39 +818,10 @@ unsafe fn flatten_bits_avx512(m: u64, rel: u16, out: *mut u16) -> usize {
     m.count_ones() as usize
 }
 
-/// [`flatten_bits`], monomorphized on the fill's x86 tier: the const
-/// comparison folds at compile time (no per-call branch survives), and
-/// the VBMI2 variant is only instantiated live inside the
-/// `#[target_feature]` `_avx512_vbmi2_crc` wrapper, so its intrinsics
-/// inline there.
-///
-/// # Safety
-///
-/// As [`flatten_bits`]; with `X86_TIER = X86_TIER_AVX512_VBMI2`,
-/// additionally [`flatten_bits_avx512`]'s contract (VBMI2 CPU, 128
-/// writable lanes).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn flatten_bits_dispatch<const X86_TIER: u8>(m: u64, rel: u16, out: *mut u16) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    if X86_TIER == X86_TIER_AVX512_VBMI2 {
-        // SAFETY: forwarded from this fn's contract.
-        return unsafe { flatten_bits_avx512(m, rel, out) };
-    }
-    // SAFETY: forwarded from this fn's contract.
-    unsafe { flatten_bits(m, rel, out) }
-}
-
-/// [`pack_mask_halves`](crate::pretokenize::pack_mask_halves) — the single
-/// source of the mask math — evaluated for each clamped length `m` in
-/// 1..=15 (entry 0 unused), as one 16-byte row so the phase-B emission
-/// loop loads both halves with a single `ldp`. That loop is
-/// issue-width-bound (~34 instructions/span before, at 4 stores + 2 loads
-/// it is nowhere near the load/store port limits), so trading the 7-op
-/// per-half shift/select chain for 1 always-L1-hot load (256 B, 4 lines)
-/// is a straight instruction-count cut. The ALU form stays in
-/// `pack_mask_halves` for the latency-chained per-span paths — see its
-/// docs for the measured cost of a dependent load on those chains.
+/// [`pack_mask_halves`](crate::pretokenize::pack_mask_halves) for each
+/// clamped length 1..=15 as one 16-byte row: the issue-bound phase-B loop
+/// loads both halves with one `ldp` (measured; the ALU form stays for the
+/// latency-bound per-span paths).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 static PACK_MASK_TABLE: [[u64; 2]; 16] = {
     let mut t = [[0u64; 2]; 16];
@@ -1003,13 +835,9 @@ static PACK_MASK_TABLE: [[u64; 2]; 16] = {
 };
 
 /// Boundary scratch of one fill: PRETOKEN_CHUNK live entries, one batch of
-/// overshoot from the last harvested batch (64 in-batch boundaries plus one
-/// scalar-overrun end), and the flatten scribble slack — 128 lanes for
-/// [`flatten_bits_avx512`]'s two unconditional 64-byte stores (the widest
-/// path; [`flatten_bits`]' 8-lane scribble is subsumed), with margin.
-/// Worst-case cursor at a flatten call: needed - 1 (= 255) at batch entry
-/// plus up to 64 in-batch boundaries already written = 319; 319 + 128 =
-/// 447 <= 464.
+/// overshoot, and the widest flatten scribble (128 lanes). Worst-case
+/// cursor at a flatten call: 255 at batch entry + 64 in-batch boundaries
+/// = 319; 319 + 128 = 447 <= 464.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const BOUND_BUF: usize = crate::pretokenize::PRETOKEN_CHUNK + 208;
 
@@ -1023,26 +851,14 @@ const REL_LIMIT: isize = u16::MAX as isize - 127;
 impl MaskState {
     /// Two-phase `fill_spans_keyed` body: phase A harvests one chunk's
     /// boundary positions into a flat buffer (branchless [`flatten_bits`]
-    /// per clean batch; the scheme's scalar `advance` through bad zones,
-    /// with `next_span`'s exact segment/overrun/tail trust rules), then
-    /// phase B turns consecutive boundary pairs into batch entries
-    /// in a counted loop with no data-dependent branch. The per-span
-    /// refill ladder, pop-exit and pack mispredicts of the fused
-    /// `next_span` loop (the dominant share of encode's 25% discarded
-    /// issue bandwidth) collapse into one predictable branch per 64-byte
-    /// batch.
-    ///
-    /// Boundary sets are identical to `next_span`'s by construction: the
-    /// same `batch_masks` bits, the same scalar re-derivation for bad
-    /// zones. Leftover boundaries past the chunk are discarded and `scan`
-    /// rewound to the grid batch containing `pos` — masks are pure
-    /// functions of the bytes, so the ~1 recomputed batch per fill buys
-    /// carry-free fills, and a later `next_span` (which only ever advances
-    /// `scan`) cannot skip the discarded bits. All other fields are reset
-    /// so iterator and chunked pulls compose in any order.
-    ///
-    /// Callers must ensure [`simd_scanner_available`] (the scheme's
-    /// `batch_masks` is unsafe to call otherwise on x86_64).
+    /// per clean batch, the scheme's scalar `advance` through bad zones
+    /// with `next_span`'s trust rules), then phase B turns consecutive
+    /// boundary pairs into batch entries in a counted loop with no
+    /// data-dependent branch. Boundary sets equal `next_span`'s by
+    /// construction; leftover boundaries past the chunk are discarded and
+    /// `scan` rewound to the grid batch containing `pos`, so iterator and
+    /// chunked pulls compose in any order. Callers must ensure
+    /// [`simd_scanner_available`].
     #[inline(always)]
     pub(crate) fn fill_spans_two_phase<'a, S: MaskScheme>(
         &mut self,
@@ -1050,22 +866,12 @@ impl MaskState {
         batch: &mut crate::pretokenize::SpanBatch<'a>,
         prefetch: &impl Fn(u64),
     ) -> usize {
-        // Tier + hash-arm dispatch, once per fill (≤ PRETOKEN_CHUNK
-        // spans), on process-immutable bits (see `fill_span_hash` for the
-        // hash-arm contract). Inside the tier wrappers the scheme's batch
-        // classifier inlines into the harvest loop and the bit-scan loops
-        // get BMI/LZCNT codegen — the per-batch tier branch and call that
-        // the provided `MaskScheme::batch_masks` pays (~2% of end-to-end
-        // encode) exist only in the DYN instantiation, which real
-        // hardware never takes: fill callers require a SIMD tier, and
-        // every AVX2/AVX-512 CPU has SSE4.2.
+        // Tier + hash-arm dispatch once per fill, on process-immutable
+        // bits (see `fill_span_hash`). Feature detection stays here:
+        // `is_x86_feature_detected!` does not const-fold inside a matching
+        // `#[target_feature]` fn.
         #[cfg(target_arch = "x86_64")]
         if crate::pretokenize::crc_hash_selected() {
-            // Feature detection (including the VBMI2 bit) stays in this
-            // once-per-fill dispatch: `is_x86_feature_detected!` does NOT
-            // const-fold inside a matching `#[target_feature]` fn (it
-            // stays an atomic load), so testing it any deeper would put
-            // the load in the loop.
             if avx512_fill_available() {
                 // SAFETY: `avx512_fill_available` verified the AVX-512
                 // scanner tier plus VBMI2; every such CPU has SSE4.2
@@ -1093,12 +899,7 @@ impl MaskState {
     }
 
     /// The AVX-512 + VBMI2 tier, CRC-hash monomorphization of
-    /// [`Self::fill_spans_two_phase`] (Zen 4/5, Ice Lake+): the AVX-512
-    /// tier wrapper plus `avx512vbmi2` for `flatten_bits_avx512` — its
-    /// only divergence from [`Self::fill_spans_two_phase_avx512_crc`],
-    /// which stays the tier for AVX-512 CPUs without VBMI2 (Skylake-X).
-    /// An AVX-512 phase-B key pack measured a large regression, see the
-    /// phase-B loop's comment.
+    /// [`Self::fill_spans_two_phase`].
     ///
     /// # Safety
     ///
@@ -1118,10 +919,8 @@ impl MaskState {
     }
 
     /// The AVX-512-tier, CRC-hash monomorphization of
-    /// [`Self::fill_spans_two_phase`]. The feature set is the AVX-512
-    /// scanner tier plus `sse4.2` for the CRC hash arm (implied by
-    /// `avx512f`, spelled out because the `X86_CRC = true` body requires
-    /// it — see `fill_span_hash`'s reachability contract).
+    /// [`Self::fill_spans_two_phase`] (`sse4.2` spelled out for the
+    /// `X86_CRC = true` body's contract).
     ///
     /// # Safety
     ///
@@ -1139,8 +938,7 @@ impl MaskState {
     }
 
     /// The AVX2-tier, CRC-hash monomorphization of
-    /// [`Self::fill_spans_two_phase`] (Haswell+, Zen 1-3; `sse4.2` is
-    /// implied by `avx` but spelled out for the CRC arm's contract).
+    /// [`Self::fill_spans_two_phase`].
     ///
     /// # Safety
     ///
@@ -1159,15 +957,13 @@ impl MaskState {
 
     /// The SSE4.2-only (CRC-hash, per-batch tier dispatch)
     /// monomorphization of [`Self::fill_spans_two_phase`]: unreachable on
-    /// real hardware (every AVX2/AVX-512 CPU has SSE4.2, so one of the
-    /// tier wrappers wins), kept for CPUID-masking hypervisors.
+    /// real hardware, kept so a CPUID-masking hypervisor cannot mix hash
+    /// arms in one process.
     ///
     /// # Safety
     ///
-    /// The CPU must support SSE4.2 (`crc_hash_selected` must have
-    /// returned true). The caller must also uphold
-    /// [`Self::fill_spans_two_phase`]'s own precondition
-    /// ([`simd_scanner_available`]).
+    /// The CPU must support SSE4.2 (`crc_hash_selected`), and
+    /// [`simd_scanner_available`] must hold.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse4.2")]
     unsafe fn fill_spans_two_phase_crc<'a, S: MaskScheme>(
@@ -1180,11 +976,9 @@ impl MaskState {
     }
 
     /// [`Self::fill_spans_two_phase`]'s body, monomorphized on the hash
-    /// arm (`X86_CRC` — see `fill_span_hash`'s reachability contract) and
-    /// the x86 SIMD tier (`X86_TIER` — the `X86_TIER_*` constants; the
-    /// AVX2/AVX-512/VBMI2 instantiations are only reachable through the
-    /// matching `#[target_feature]` wrappers above, whose feature sets
-    /// cover every intrinsic their tier's arms use).
+    /// arm (`X86_CRC`, see `fill_span_hash`) and the x86 SIMD tier
+    /// (`X86_TIER`; SIMD instantiations are reachable only through the
+    /// matching `#[target_feature]` wrappers above).
     #[inline(always)]
     fn fill_spans_two_phase_impl<'a, S: MaskScheme, const X86_CRC: bool, const X86_TIER: u8>(
         &mut self,
@@ -1212,6 +1006,9 @@ impl MaskState {
         // addresses are "free to recompute" to the register allocator);
         // pinning it here keeps the loop at one indexed ldp per span.
         let pack_masks: *const [u64; 2] = std::hint::black_box(PACK_MASK_TABLE.as_ptr());
+        // Flatten scribble bound per call: 128 lanes (VBMI2) or popcount
+        // + 7 (scalar); see BOUND_BUF.
+        let scribble = if X86_TIER == X86_TIER_AVX512_VBMI2 { 128 } else { 72 };
 
         'refill: while n < PRETOKEN_CHUNK && pending < len {
             // Skip grid batches wholly behind `pending` (a direct-emitted
@@ -1291,12 +1088,8 @@ impl MaskState {
                 };
                 let rel = base.wrapping_sub(fill_base) as u16;
                 if bad & blive == 0 {
-                    // Scribble bound: 128 lanes (VBMI2 tier) / popcount +
-                    // 7 (scalar) — see BOUND_BUF's worst-case analysis.
-                    debug_assert!(nb + if X86_TIER == X86_TIER_AVX512_VBMI2 { 128 } else { 72 } <= BOUND_BUF);
-                    nb += unsafe {
-                        flatten_bits_dispatch::<X86_TIER>(usable & ulive, rel, bufp.add(nb))
-                    };
+                    debug_assert!(nb + scribble <= BOUND_BUF);
+                    nb += unsafe { flatten_bits::<X86_TIER>(usable & ulive, rel, bufp.add(nb)) };
                     scan = base + 64;
                     continue;
                 }
@@ -1307,17 +1100,15 @@ impl MaskState {
                 loop {
                     let seg_bad = bad & blive;
                     if seg_bad == 0 {
-                        debug_assert!(nb + if X86_TIER == X86_TIER_AVX512_VBMI2 { 128 } else { 72 } <= BOUND_BUF);
-                        nb += unsafe {
-                            flatten_bits_dispatch::<X86_TIER>(usable & ulive, rel, bufp.add(nb))
-                        };
+                        debug_assert!(nb + scribble <= BOUND_BUF);
+                        nb += unsafe { flatten_bits::<X86_TIER>(usable & ulive, rel, bufp.add(nb)) };
                         scan = base + 64;
                         break;
                     }
                     let fb = seg_bad.trailing_zeros();
                     let prefix = usable & ulive & !(u64::MAX << fb);
-                    debug_assert!(nb + if X86_TIER == X86_TIER_AVX512_VBMI2 { 128 } else { 72 } <= BOUND_BUF);
-                    nb += unsafe { flatten_bits_dispatch::<X86_TIER>(prefix, rel, bufp.add(nb)) };
+                    debug_assert!(nb + scribble <= BOUND_BUF);
+                    nb += unsafe { flatten_bits::<X86_TIER>(prefix, rel, bufp.add(nb)) };
                     let mut p = if nb > 0 {
                         fill_base + unsafe { *bufp.add(nb - 1) } as usize
                     } else {
@@ -1388,24 +1179,13 @@ impl MaskState {
             let last_end = unsafe { *bufp.add(emit_n - 1) } as usize;
             let entries = &mut batch.entries[n..n + emit_n];
             let base_ptr = unsafe { bytes.as_ptr().add(fill_base) };
-            // `prev`/`end` in usize: the u16 boundary domain forced two
-            // `& 0xffff` masks and a duplicated 15-compare per span (the
-            // compiler cannot see end >= prev in u16 subtraction).
+            // `prev`/`end` in usize: the u16 domain costs masks and a
+            // duplicated compare per span.
             let mut prev = 0usize;
             if fill_base + last_end + 16 <= len {
-                // Every x86 tier shares this scalar key pack. An AVX-512
-                // masked pack (`vmovdqu8 {k}{z}` under a tok_len-derived
-                // kmask, vpextrq/vmovq into the CRC) measured −36% warm /
-                // −30% cold on Zen 5 (5-round interleaved A/B, 1 GB
-                // gpt2, tokens identical): this plain load's address
-                // depends only on `prev`, so it issues early and the
-                // table row + ANDs apply late, while the masked load's
-                // kmask waits on the whole boundary→tok_len chain and the
-                // extracts add a vector→GPR crossing before the CRC —
-                // per-span work went from overlapping to serialized
-                // (~90% of loop samples on the masked load + dependents).
-                // Do not re-try; the VBMI2 tier's only divergence is
-                // `flatten_bits_avx512` in phase A.
+                // Every x86 tier shares this scalar key pack: an AVX-512
+                // masked pack measured -36% (its kmask serializes on the
+                // boundary chain). Do not re-try.
                 for (i, e) in entries.iter_mut().enumerate() {
                     let end = unsafe { *bufp.add(i) } as usize;
                     let tok_len = end - prev;

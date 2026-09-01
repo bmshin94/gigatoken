@@ -1,55 +1,8 @@
-use icu::properties::props::{EnumeratedProperty, GeneralCategory, GeneralCategoryGroup, WhiteSpace};
 use icu::properties::CodePointSetData;
+use icu::properties::props::{GeneralCategory, GeneralCategoryGroup, WhiteSpace};
+use std::ops::RangeInclusive;
 
-#[inline]
-pub(crate) fn get_general_category(c: char) -> GeneralCategory {
-    GeneralCategory::for_char(c)
-}
-
-#[inline]
-pub(crate) fn is_gc_letter(gc: GeneralCategory) -> bool {
-    GeneralCategoryGroup::Letter.contains(gc)
-}
-
-#[inline]
-pub(crate) fn is_gc_number(gc: GeneralCategory) -> bool {
-    GeneralCategoryGroup::Number.contains(gc)
-}
-
-/// Unicode White_Space property — matches the same characters as `\s` in regex.
-/// This includes GeneralCategory::Separator (Zs/Zl/Zp) PLUS control characters
-/// like U+0009 (TAB), U+000A (LF), U+000D (CR), U+0085 (NEL), etc.
-#[inline]
-pub(crate) fn is_whitespace(c: char) -> bool {
-    // The set is a static compiled-data lookup, but cache the borrowed handle
-    // to avoid repeated constructor overhead.
-    static WS: std::sync::LazyLock<icu::properties::CodePointSetDataBorrowed<'static>> =
-        std::sync::LazyLock::new(CodePointSetData::new::<WhiteSpace>);
-    WS.contains(c)
-}
-
-#[inline]
-pub(crate) fn is_letter(c: char) -> bool {
-    is_gc_letter(get_general_category(c))
-}
-
-#[inline]
-pub(crate) fn is_number(c: char) -> bool {
-    is_gc_number(get_general_category(c))
-}
-
-#[inline]
-pub(crate) fn is_other_complete(c: char) -> bool {
-    if c.is_ascii() {
-        return !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace();
-    }
-    let gc = get_general_category(c);
-    !is_gc_letter(gc) && !is_gc_number(gc) && !is_whitespace(c)
-}
-
-// ---------------------------------------------------------------------------
-// Packed codepoint → class table (hot-path classification)
-// ---------------------------------------------------------------------------
+// Packed codepoint -> class table (hot-path classification)
 
 /// Character class as used by the pretokenization regexes: `\p{L}`, `\p{N}`,
 /// `\s` (White_Space), and everything else.
@@ -62,57 +15,73 @@ pub(crate) enum CharClass {
     Other = 3,
 }
 
-/// 2-bit class per codepoint, 4 codepoints per byte (~272 KiB total).
-/// A single L1 load replaces the ICU GeneralCategory trie walk plus the
-/// White_Space set binary search that the `is_*` predicates above pay per
-/// call. Only the cache lines for scripts actually present in the input
-/// stay resident.
+/// 2-bit class per codepoint, 4 codepoints per byte (~272 KiB): one L1
+/// load replaces the ICU GeneralCategory trie walk plus the White_Space
+/// set search.
 static CLASS_TABLE: std::sync::LazyLock<Box<[u8]>> =
     std::sync::LazyLock::new(build_class_table);
 
+/// Set `class` for every codepoint in `ranges`.
+fn fill_ranges(
+    classes: &mut [u8],
+    ranges: impl Iterator<Item = RangeInclusive<u32>>,
+    class: u8,
+) {
+    for range in ranges {
+        classes[*range.start() as usize..=*range.end() as usize].fill(class);
+    }
+}
+
 fn build_class_table() -> Box<[u8]> {
     use icu::properties::CodePointMapData;
-    const N: usize = 0x110000;
-    let mut classes = vec![CharClass::Other as u8; N];
+    let mut classes = vec![CharClass::Other as u8; 0x110000];
     let gc = CodePointMapData::<GeneralCategory>::new();
     for (group, class) in [
         (GeneralCategoryGroup::Letter, CharClass::Letter),
         (GeneralCategoryGroup::Number, CharClass::Number),
     ] {
-        for range in gc.iter_ranges_for_group(group) {
-            classes[*range.start() as usize..=*range.end() as usize].fill(class as u8);
-        }
+        fill_ranges(&mut classes, gc.iter_ranges_for_group(group), class as u8);
     }
     // White_Space is disjoint from GC Letter/Number, so fill order is moot.
-    for range in CodePointSetData::new::<WhiteSpace>().iter_ranges() {
-        classes[*range.start() as usize..=*range.end() as usize].fill(CharClass::Whitespace as u8);
-    }
+    fill_ranges(
+        &mut classes,
+        CodePointSetData::new::<WhiteSpace>().iter_ranges(),
+        CharClass::Whitespace as u8,
+    );
     classes
         .as_chunks::<4>().0.iter()
         .map(|c| c[0] | (c[1] << 2) | (c[2] << 4) | (c[3] << 6))
         .collect()
 }
 
-/// Pre-resolved handle to the packed class table. The static is a
-/// `LazyLock<Box<[u8]>>`, so every bare [`class_of`] call pays the
-/// lazy-init state check plus a dependent load of the Box pointer before
-/// the table load itself; per-char classify loops resolve the handle once
-/// and index the slice directly.
+/// Pre-resolved handle to a packed class table, so per-char classify
+/// loops pay the `LazyLock` check once instead of per lookup.
+/// `MARKS_JOIN` selects the four-class view where `\p{M}` counts as a
+/// letter (Qwen3.5's `[\p{L}\p{M}]+` / `[^\s\p{L}\p{M}\p{N}]+`), read from
+/// the DeepSeek table.
 #[derive(Clone, Copy)]
-pub(crate) struct ClassTable(&'static [u8]);
+pub(crate) struct ClassTable<const MARKS_JOIN: bool>(&'static [u8]);
 
-impl ClassTable {
+impl<const MARKS_JOIN: bool> ClassTable<MARKS_JOIN> {
     #[inline]
     pub(crate) fn get() -> Self {
-        Self(&CLASS_TABLE)
+        Self(if MARKS_JOIN { &DS_CLASS_TABLE } else { &CLASS_TABLE })
     }
 
-    /// [`class_of`] without the per-call static resolution. `cp` must be
-    /// a valid scalar value (guaranteed when decoded from valid UTF-8).
+    /// Classify a scalar value (`cp < 0x110000`) with one table load.
     #[inline(always)]
     pub(crate) fn class_of(self, cp: u32) -> CharClass {
+        if MARKS_JOIN {
+            return match DsClassTable(self.0).ds_class_of(cp) {
+                DsCharClass::Letter | DsCharClass::Mark => CharClass::Letter,
+                DsCharClass::Number => CharClass::Number,
+                DsCharClass::Whitespace => CharClass::Whitespace,
+                DsCharClass::PunctSym | DsCharClass::Other => CharClass::Other,
+            };
+        }
         debug_assert!(cp < 0x110000);
-        // SAFETY: `self.0` is CLASS_TABLE (the only constructor), sized
+        // SAFETY: only the `false` instantiation reaches here (the `true`
+        // one returned above), so `self.0` is CLASS_TABLE, sized
         // 0x110000 / 4; cp >> 2 is in range for any scalar value.
         let byte = unsafe { *self.0.get_unchecked((cp >> 2) as usize) };
         match (byte >> ((cp & 3) << 1)) & 3 {
@@ -124,16 +93,13 @@ impl ClassTable {
     }
 }
 
-/// Classify a codepoint with one table load. `cp` must be a valid scalar
-/// value (guaranteed when decoded from valid UTF-8).
+/// Classify a scalar value (`cp < 0x110000`) with one table load.
 #[inline(always)]
 pub(crate) fn class_of(cp: u32) -> CharClass {
-    ClassTable::get().class_of(cp)
+    ClassTable::<false>::get().class_of(cp)
 }
 
-// ---------------------------------------------------------------------------
 // DeepSeek character classes (finer split of `Other`)
-// ---------------------------------------------------------------------------
 
 /// Character class as used by the DeepSeek V3 main regex, which additionally
 /// distinguishes `\p{M}` (joins letter runs) and `\p{P}`/`\p{S}` (punctuation
@@ -150,23 +116,13 @@ pub(crate) enum DsCharClass {
     Other = 5,
 }
 
-/// Four-class view for schemes whose regex joins `\p{M}` into letter
-/// runs and excludes it from punctuation runs (Qwen3.5's
-/// `[\p{L}\p{M}]+` / `[^\s\p{L}\p{M}\p{N}]+`): marks classify as
-/// letters, everything else as in [`class_of`].
-#[inline(always)]
-pub(crate) fn class_of_marks_join(cp: u32) -> CharClass {
-    DsClassTable::get().class_of_marks_join(cp)
-}
-
 /// 4-bit class per codepoint, 2 codepoints per byte (~544 KiB total).
 static DS_CLASS_TABLE: std::sync::LazyLock<Box<[u8]>> =
     std::sync::LazyLock::new(build_ds_class_table);
 
 fn build_ds_class_table() -> Box<[u8]> {
     use icu::properties::CodePointMapData;
-    const N: usize = 0x110000;
-    let mut classes = vec![DsCharClass::Other as u8; N];
+    let mut classes = vec![DsCharClass::Other as u8; 0x110000];
     let gc = CodePointMapData::<GeneralCategory>::new();
     for (group, class) in [
         (GeneralCategoryGroup::Letter, DsCharClass::Letter),
@@ -175,24 +131,19 @@ fn build_ds_class_table() -> Box<[u8]> {
         (GeneralCategoryGroup::Punctuation, DsCharClass::PunctSym),
         (GeneralCategoryGroup::Symbol, DsCharClass::PunctSym),
     ] {
-        for range in gc.iter_ranges_for_group(group) {
-            classes[*range.start() as usize..=*range.end() as usize].fill(class as u8);
-        }
+        fill_ranges(&mut classes, gc.iter_ranges_for_group(group), class as u8);
     }
     // White_Space is disjoint from the groups above except Zs/Zl/Zp (which
     // are in none of them), so fill order is moot.
-    for range in CodePointSetData::new::<WhiteSpace>().iter_ranges() {
-        classes[*range.start() as usize..=*range.end() as usize]
-            .fill(DsCharClass::Whitespace as u8);
-    }
-    classes
-        .as_chunks::<2>().0.iter()
-        .map(|c| c[0] | (c[1] << 4))
-        .collect()
+    fill_ranges(
+        &mut classes,
+        CodePointSetData::new::<WhiteSpace>().iter_ranges(),
+        DsCharClass::Whitespace as u8,
+    );
+    pack_nibbles(&classes)
 }
 
-/// Pre-resolved handle to the packed DeepSeek class table — same
-/// LazyLock-hoist rationale as [`ClassTable`].
+/// Pre-resolved handle to the packed DeepSeek class table (see [`ClassTable`]).
 #[derive(Clone, Copy)]
 pub(crate) struct DsClassTable(&'static [u8]);
 
@@ -202,13 +153,12 @@ impl DsClassTable {
         Self(&DS_CLASS_TABLE)
     }
 
-    /// [`ds_class_of`] without the per-call static resolution. `cp` must
-    /// be a valid scalar value (guaranteed when decoded from valid UTF-8).
+    /// Classify a scalar value (`cp < 0x110000`) with one table load.
     #[inline(always)]
     pub(crate) fn ds_class_of(self, cp: u32) -> DsCharClass {
         debug_assert!(cp < 0x110000);
-        // SAFETY: `self.0` is DS_CLASS_TABLE (the only constructor), sized
-        // 0x110000 / 2; cp >> 1 is in range for any scalar value.
+        // SAFETY: `self.0` is DS_CLASS_TABLE, sized 0x110000 / 2; cp >> 1
+        // is in range for any scalar value.
         let byte = unsafe { *self.0.get_unchecked((cp >> 1) as usize) };
         match (byte >> ((cp & 1) << 2)) & 0xF {
             0 => DsCharClass::Letter,
@@ -219,29 +169,15 @@ impl DsClassTable {
             _ => DsCharClass::Other,
         }
     }
-
-    /// [`class_of_marks_join`] without the per-call static resolution.
-    #[inline(always)]
-    pub(crate) fn class_of_marks_join(self, cp: u32) -> CharClass {
-        match self.ds_class_of(cp) {
-            DsCharClass::Letter | DsCharClass::Mark => CharClass::Letter,
-            DsCharClass::Number => CharClass::Number,
-            DsCharClass::Whitespace => CharClass::Whitespace,
-            DsCharClass::PunctSym | DsCharClass::Other => CharClass::Other,
-        }
-    }
 }
 
-/// Classify a codepoint for the DeepSeek scheme with one table load. `cp`
-/// must be a valid scalar value (guaranteed when decoded from valid UTF-8).
+/// Classify a scalar value for the DeepSeek scheme with one table load.
 #[inline(always)]
 pub(crate) fn ds_class_of(cp: u32) -> DsCharClass {
     DsClassTable::get().ds_class_of(cp)
 }
 
-// ---------------------------------------------------------------------------
 // o200k character classes (case-aware split of Letter)
-// ---------------------------------------------------------------------------
 
 /// Character class as used by the o200k regex family (gpt-oss, Nemotron-3),
 /// whose letter runs are case-structured:
@@ -275,8 +211,7 @@ fn build_o200k_class_table() -> Box<[u8]> {
 /// o200k and Kimi table builders start from).
 fn o200k_classes_unpacked() -> Vec<u8> {
     use icu::properties::CodePointMapData;
-    const N: usize = 0x110000;
-    let mut classes = vec![O200kCharClass::Other as u8; N];
+    let mut classes = vec![O200kCharClass::Other as u8; 0x110000];
     let gc = CodePointMapData::<GeneralCategory>::new();
     for (category, class) in [
         (GeneralCategory::UppercaseLetter, O200kCharClass::Upper),
@@ -285,23 +220,20 @@ fn o200k_classes_unpacked() -> Vec<u8> {
         (GeneralCategory::ModifierLetter, O200kCharClass::Caseless),
         (GeneralCategory::OtherLetter, O200kCharClass::Caseless),
     ] {
-        for range in gc.iter_ranges_for_value(category) {
-            classes[*range.start() as usize..=*range.end() as usize].fill(class as u8);
-        }
+        fill_ranges(&mut classes, gc.iter_ranges_for_value(category), class as u8);
     }
     for (group, class) in [
         (GeneralCategoryGroup::Mark, O200kCharClass::Mark),
         (GeneralCategoryGroup::Number, O200kCharClass::Number),
     ] {
-        for range in gc.iter_ranges_for_group(group) {
-            classes[*range.start() as usize..=*range.end() as usize].fill(class as u8);
-        }
+        fill_ranges(&mut classes, gc.iter_ranges_for_group(group), class as u8);
     }
     // White_Space is disjoint from Letter/Mark/Number, so fill order is moot.
-    for range in CodePointSetData::new::<WhiteSpace>().iter_ranges() {
-        classes[*range.start() as usize..=*range.end() as usize]
-            .fill(O200kCharClass::Whitespace as u8);
-    }
+    fill_ranges(
+        &mut classes,
+        CodePointSetData::new::<WhiteSpace>().iter_ranges(),
+        O200kCharClass::Whitespace as u8,
+    );
     classes
 }
 
@@ -313,9 +245,7 @@ fn pack_nibbles(classes: &[u8]) -> Box<[u8]> {
         .collect()
 }
 
-/// Classify a codepoint for the o200k scheme family with one table load.
-/// `cp` must be a valid scalar value (guaranteed when decoded from valid
-/// UTF-8).
+/// Classify a scalar value for the o200k scheme family with one table load.
 #[inline(always)]
 pub(crate) fn o200k_class_of(cp: u32) -> O200kCharClass {
     debug_assert!(cp < 0x110000);
@@ -331,9 +261,7 @@ pub(crate) fn o200k_class_of(cp: u32) -> O200kCharClass {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Kimi character classes (o200k classes with Script=Han split out)
-// ---------------------------------------------------------------------------
 
 /// Character class for the Kimi (moonshotai K2 family) regex: the o200k
 /// classes with `\p{Han}` split out. The pattern gives Han runs their own
@@ -415,8 +343,7 @@ fn build_kimi_class_table() -> Box<[u8]> {
     pack_nibbles(&classes)
 }
 
-/// Classify a codepoint for the Kimi scheme with one table load. `cp` must
-/// be a valid scalar value (guaranteed when decoded from valid UTF-8).
+/// Classify a scalar value for the Kimi scheme with one table load.
 #[inline(always)]
 pub(crate) fn kimi_class_of(cp: u32) -> KimiCharClass {
     debug_assert!(cp < 0x110000);
@@ -446,15 +373,34 @@ pub(crate) fn is_deepseek_cjk(cp: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icu::properties::props::EnumeratedProperty;
+
+    fn gc(c: char) -> GeneralCategory {
+        GeneralCategory::for_char(c)
+    }
+
+    fn is_gc_letter(gc: GeneralCategory) -> bool {
+        GeneralCategoryGroup::Letter.contains(gc)
+    }
+
+    fn is_gc_number(gc: GeneralCategory) -> bool {
+        GeneralCategoryGroup::Number.contains(gc)
+    }
+
+    /// Unicode White_Space, the set `\s` matches: Zs/Zl/Zp plus controls
+    /// like TAB, LF, CR, NEL.
+    fn is_whitespace(c: char) -> bool {
+        CodePointSetData::new::<WhiteSpace>().contains(c)
+    }
 
     /// The packed table must agree with the ICU predicates for every scalar.
     #[test]
     fn class_table_matches_icu() {
         for cp in 0..=char::MAX as u32 {
             let Some(c) = char::from_u32(cp) else { continue };
-            let expected = if is_letter(c) {
+            let expected = if is_gc_letter(gc(c)) {
                 CharClass::Letter
-            } else if is_number(c) {
+            } else if is_gc_number(gc(c)) {
                 CharClass::Number
             } else if is_whitespace(c) {
                 CharClass::Whitespace
@@ -465,12 +411,30 @@ mod tests {
         }
     }
 
+    /// The mark-joining view must be `ds_class_of` folded onto four classes.
+    #[test]
+    fn marks_join_view_matches_ds_table() {
+        let t = ClassTable::<true>::get();
+        for cp in 0..=char::MAX as u32 {
+            if char::from_u32(cp).is_none() {
+                continue;
+            }
+            let expected = match ds_class_of(cp) {
+                DsCharClass::Letter | DsCharClass::Mark => CharClass::Letter,
+                DsCharClass::Number => CharClass::Number,
+                DsCharClass::Whitespace => CharClass::Whitespace,
+                DsCharClass::PunctSym | DsCharClass::Other => CharClass::Other,
+            };
+            assert_eq!(t.class_of(cp), expected, "mismatch at U+{cp:04X}");
+        }
+    }
+
     /// The o200k table must agree with ICU for every scalar.
     #[test]
     fn o200k_class_table_matches_icu() {
         for cp in 0..=char::MAX as u32 {
             let Some(c) = char::from_u32(cp) else { continue };
-            let gc = get_general_category(c);
+            let gc = gc(c);
             let expected = if matches!(
                 gc,
                 GeneralCategory::UppercaseLetter | GeneralCategory::TitlecaseLetter
@@ -524,7 +488,7 @@ mod tests {
     fn ds_class_table_matches_icu() {
         for cp in 0..=char::MAX as u32 {
             let Some(c) = char::from_u32(cp) else { continue };
-            let gc = get_general_category(c);
+            let gc = gc(c);
             let expected = if is_gc_letter(gc) {
                 DsCharClass::Letter
             } else if is_gc_number(gc) {

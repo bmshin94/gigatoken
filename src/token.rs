@@ -17,12 +17,6 @@ impl From<usize> for TokenId {
     }
 }
 
-impl From<i32> for TokenId {
-    fn from(value: i32) -> Self {
-        TokenId(value as u32)
-    }
-}
-
 impl From<TokenId> for u32 {
     fn from(val: TokenId) -> Self {
         val.0

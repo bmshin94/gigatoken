@@ -1,24 +1,13 @@
-"""HuggingFace Hub file fetch — thin forwards to the Rust implementation.
-
-The mechanics live in Rust (`src/load_tokenizer/hub.rs`) and mirror
-`huggingface_hub.hf_hub_download` — same endpoint and URL layout, same token
-discovery (HF_TOKEN env var, then the token file written by `hf auth login`),
-same cache directory resolution — without requiring huggingface_hub,
-tokenizers, or transformers to be installed. Files already present in the
-standard HF cache are served with a pure-filesystem lookup (no network); on a
-miss the file is downloaded straight into the shared HF cache, so later loads
-(ours and huggingface_hub's) are served from it.
-"""
+"""HuggingFace Hub file fetch: thin forwards to `src/load_tokenizer/hub.rs`,
+which mirrors `huggingface_hub.hf_hub_download` (same URL layout, token
+discovery and cache layout) without requiring huggingface_hub."""
 
 from __future__ import annotations
 
 from gigatoken.gigatoken_rs import get_hf_token, hub_file, looks_like_repo_id
 
-# Filename suffixes of local tokenizer files (tokenizer.json contents and raw
-# sentencepiece models — the formats `gigatoken._load.hf.to_tokenizer_json`
-# reads from disk). A name ending in one of these is never treated as a Hub
-# repo id, so a mistyped local path fails fast instead of hitting the network.
-# Keep in sync with TOKENIZER_FILE_SUFFIXES in `src/load_tokenizer/hub.rs`.
+# A name ending in one of these is a local tokenizer file, never a Hub repo
+# id. Keep in sync with TOKENIZER_FILE_SUFFIXES in `src/load_tokenizer/hub.rs`.
 TOKENIZER_FILE_SUFFIXES = (".json", ".model")
 
 __all__ = [

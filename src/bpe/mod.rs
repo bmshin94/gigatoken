@@ -3,22 +3,14 @@ pub mod sentencepiece;
 pub mod tiktoken;
 
 /// Ask the kernel for 2 MiB pages over `[ptr, ptr + bytes)` before first
-/// touch. Huge pages cut the fault count of faulting in a multi-GB buffer
-/// ~500x, and Zen drops software prefetches that miss the TLB, so both the
-/// pretoken-cache table and the batch gather's copies want the coverage.
-/// `MADV_HUGEPAGE` only hints page sizing; no-op off Linux (and where THP
-/// is unavailable). Lives here (not `batch`) so the bin target's module
-/// tree, which includes `bpe` but not `batch`, sees one copy too.
+/// touch (fewer faults, and Zen drops software prefetches that miss the
+/// TLB). A hint only; no-op off Linux. Lives here so the bin target's
+/// module tree sees it too.
 pub(crate) fn madvise_hugepage(ptr: *mut u8, bytes: usize) {
     #[cfg(target_os = "linux")]
     {
-        // madvise demands a page-aligned start, and Vec/malloc pointers to
-        // mmap-served allocations sit 16 bytes past the page boundary (the
-        // allocator header) — passed through raw, every Vec-backed call
-        // here returned EINVAL and the hint was silently dead (only the
-        // 2 MiB-`aligned_alloc` table pointer ever worked). Align inward:
-        // trimming the sub-page head is harmless, the kernel flags whole
-        // VMAs and backs 2 MiB-aligned extents regardless.
+        // Align inward: malloc pointers sit 16 B past the page boundary and
+        // madvise returns EINVAL on an unaligned start.
         const PAGE: usize = 4096;
         let start = (ptr as usize + PAGE - 1) & !(PAGE - 1);
         let end = (ptr as usize).saturating_add(bytes);
@@ -37,10 +29,6 @@ pub(crate) fn madvise_hugepage(ptr: *mut u8, bytes: usize) {
 use crate::token::TokenId;
 use eyre::{Result, anyhow};
 use std::collections::HashMap;
-
-// ---------------------------------------------------------------------------
-// ByteRemapping — shared between tokenizer types
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct ByteRemapping {
@@ -72,12 +60,12 @@ impl ByteRemapping {
     /// out-of-range `TokenId` even if fed malformed bytes.
     pub fn from_byte_vocab(vocab: &[impl AsRef<[u8]>]) -> Result<Option<Self>> {
         const UNSET: u32 = u32::MAX;
-        let mut mapping = vec![TokenId::from(UNSET); 256];
+        let mut mapping = vec![TokenId(UNSET); 256];
         for (id, entry) in vocab.iter().enumerate() {
             if let &[b] = entry.as_ref()
                 && mapping[b as usize].0 == UNSET
             {
-                mapping[b as usize] = TokenId::from(id as u32);
+                mapping[b as usize] = TokenId(id as u32);
             }
         }
         if let Some(missing) = mapping
@@ -93,7 +81,7 @@ impl ByteRemapping {
         // an unexpected malformed byte indexes a valid token instead of OOB.
         for t in mapping.iter_mut() {
             if t.0 == UNSET {
-                *t = TokenId::from(0);
+                *t = TokenId(0);
             }
         }
         Ok(mapping
@@ -104,42 +92,18 @@ impl ByteRemapping {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PairRankTable — flat pair-rank lookups for the merge hot path
-// ---------------------------------------------------------------------------
-
-/// Merge-pair lookup structure replacing the hashbrown `merges` map on the
-/// cache-miss merge path. Two levels, both immutable after construction (so
-/// forks share one copy via `Arc` instead of cloning the map):
-///
-/// - a dense `byte × byte` grid covering every pair whose sides are both
-///   below the initial-symbol range (256 for GPT-2, 512 for DeepSeek-style
-///   layouts). All round-1 lookups — roughly half of all lookups per miss,
-///   since initial symbols are byte tokens — become one shift-or index and
-///   one L1/L2 load: no hash, no probe.
-/// - a flat open-addressed table of all merges: power-of-two slots at
-///   ≤ 1/2 load, linear probing, one `u64` slot packing key and value
-///   (`(key << 21) | merged_id`; keys are 42 bits and merged IDs 21, so a
-///   packed slot uses 63 bits and `u64::MAX` can never collide) so a probe
-///   touches one 8-byte load per step — the hit's value rides on the same
-///   line as its key. hashbrown pays a tuple hash, a ctrl-byte line, a
-///   NEON group match, and a second line for the bucket per lookup; this
-///   pays one multiply, one load, one compare — and the common mid-merge
-///   *miss* usually terminates on the first empty slot.
-///
-/// Values are merged token IDs (`u32::MAX` = no merge), matching the
-/// tiktoken-style convention that merged ID order == merge priority.
-/// [`Self::build`] returns `None` for vocabularies that violate its packing
-/// invariants; callers then keep using the hashbrown map.
+/// Merge-pair lookup replacing the hashbrown `merges` map on the miss
+/// path: a dense grid for pairs with both sides `< 2^DENSE_LOG2` (byte
+/// tokens plus the earliest ~1.8k merges, which dominate lookups) over a
+/// flat open-addressed table of all merges at ≤ 1/2 load whose `u64` slots
+/// pack key and value, so a probe is one multiply, one load, one compare.
+/// Values are merged token IDs (`u32::MAX` = no merge). [`Self::build`]
+/// returns `None` for vocabularies that violate its packing invariants.
 pub(crate) struct PairRankTable {
-    /// `dense[(a << dense_log2) | b]` = merged ID for pairs with both sides
-    /// `< 2^dense_log2`, `u32::MAX` when they do not merge.
+    /// `dense[(a << DENSE_LOG2) | b]`, `u32::MAX` when the pair does not merge.
     dense: Box<[u32]>,
-    dense_log2: u32,
-    /// Flat table slots, `((a << 21 | b) << 21) | merged_id` packed;
-    /// `u64::MAX` = empty (real slots fit 63 bits, so the sentinel can
-    /// never collide, and its key field `MAX >> 21` exceeds every real
-    /// 42-bit key, so the hit compare rejects it for free).
+    /// `((a << 21 | b) << 21) | merged_id`; `u64::MAX` = empty (real slots
+    /// fit 63 bits, and the sentinel's key field exceeds every real key).
     slots: Box<[u64]>,
     /// `slots.len() - 1` (length is a power of two).
     mask: usize,
@@ -149,20 +113,18 @@ pub(crate) struct PairRankTable {
 
 /// Every token ID must fit a 21-bit key lane (covers any vocab < 2M IDs).
 const PAIR_ID_BITS: u32 = 21;
+/// Dense grid covers pairs with both sides < 2^11 (16 MiB, L3-resident).
+const DENSE_LOG2: u32 = 11;
 
 impl PairRankTable {
-    /// Build the two-level table, or `None` when this vocabulary cannot use
-    /// it (IDs too large for the packed key, or pathological clustering in
-    /// the flat table) — the caller then falls back to the hashbrown map.
+    /// Build the table, or `None` when this vocabulary cannot use it (IDs
+    /// too large for the packed key, or pathological clustering).
     pub(crate) fn build<S: std::hash::BuildHasher>(
         merges: &HashMap<(TokenId, TokenId), TokenId, S>,
-        byte_remapping: Option<&ByteRemapping>,
         vocab_len: usize,
     ) -> Option<Self> {
-        // Key packing needs every ID that can appear as a merge-loop symbol
-        // (byte-token IDs and merged IDs are all vocab IDs) below 2^21. The
-        // per-merge check is defensive: `merges` is caller-supplied and need
-        // not be consistent with `vocab_len`.
+        // Every ID that can appear as a merge-loop symbol must be < 2^21;
+        // the per-merge check is defensive (`merges` is caller-supplied).
         if vocab_len > 1 << PAIR_ID_BITS {
             return None;
         }
@@ -174,30 +136,15 @@ impl PairRankTable {
             return None;
         }
 
-        // Dense level covering every pair with both sides < 2^11 — the
-        // initial byte tokens (0..255 for GPT-2, 3..258 for DeepSeek) AND
-        // the earliest ~1.8k merged IDs, which by merge order are the most
-        // frequent symbols in the merge loop. Round-1 lookups plus the bulk
-        // of mid-merge lookups (hits and, crucially, no-merge misses, which
-        // the flat table answers only after probing to an empty slot)
-        // become one shift-or index and one load into a 16 MiB, L3-resident,
-        // Arc-shared grid. A vocab with byte tokens above the grid keeps
-        // correctness — its round-1 lookups just fall through to the flat
-        // table.
-        let max_initial = byte_remapping
-            .map_or(255, |br| br.mapping.iter().map(|t| t.0).max().unwrap_or(0));
-        let dense_log2 = (32 - max_initial.leading_zeros()).clamp(11, 11);
-        let mut dense = vec![u32::MAX; 1usize << (2 * dense_log2)].into_boxed_slice();
-
-        // Flat level holds all merges (including the dense subset, so it is
-        // a complete map on its own) at ≤ 1/2 load.
+        let mut dense = vec![u32::MAX; 1usize << (2 * DENSE_LOG2)].into_boxed_slice();
+        // The flat level holds all merges (dense subset included) at ≤ 1/2 load.
         let n_slots = (merges.len().max(1) * 2).next_power_of_two().max(64);
         let shift = 64 - n_slots.trailing_zeros();
         let mask = n_slots - 1;
         let mut slots = vec![u64::MAX; n_slots].into_boxed_slice();
         for (&(a, b), &m) in merges {
-            if (a.0 | b.0) >> dense_log2 == 0 {
-                dense[((a.0 as usize) << dense_log2) | b.0 as usize] = m.0;
+            if (a.0 | b.0) >> DENSE_LOG2 == 0 {
+                dense[((a.0 as usize) << DENSE_LOG2) | b.0 as usize] = m.0;
             }
             let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
             let mut idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize;
@@ -205,28 +152,23 @@ impl PairRankTable {
             while slots[idx] != u64::MAX {
                 idx = (idx + 1) & mask;
                 displacement += 1;
-                // Ugly clustering (never seen on real vocabs at this load
-                // factor): give up rather than degrade every miss lookup.
+                // Give up on ugly clustering rather than degrade every miss lookup.
                 if displacement > 64 {
                     return None;
                 }
             }
-            // Merged IDs are < 2^21 (checked above), so key and value pack
-            // into 63 bits without overlap.
             slots[idx] = (key << PAIR_ID_BITS) | m.0 as u64;
         }
 
-        Some(PairRankTable { dense, dense_log2, slots, mask, shift })
+        Some(PairRankTable { dense, slots, mask, shift })
     }
 
-    /// Merged token ID of the pair `(a, b)`, or `u32::MAX` when it does not
-    /// merge — the same convention as probing the merges map.
+    /// Merged token ID of the pair `(a, b)`, or `u32::MAX` when it does not merge.
     #[inline(always)]
     pub(crate) fn rank(&self, a: TokenId, b: TokenId) -> u32 {
-        if (a.0 | b.0) >> self.dense_log2 == 0 {
-            let idx = ((a.0 as usize) << self.dense_log2) | b.0 as usize;
-            // SAFETY: both IDs < 2^dense_log2, so idx < 2^(2*dense_log2)
-            // == dense.len().
+        if (a.0 | b.0) >> DENSE_LOG2 == 0 {
+            let idx = ((a.0 as usize) << DENSE_LOG2) | b.0 as usize;
+            // SAFETY: both IDs < 2^DENSE_LOG2, so idx < dense.len().
             return unsafe { *self.dense.get_unchecked(idx) };
         }
         let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
@@ -235,10 +177,6 @@ impl PairRankTable {
             // SAFETY: idx starts < slots.len() (shift keeps log2(len) bits)
             // and stays masked.
             let slot = unsafe { *self.slots.get_unchecked(idx) };
-            // One load answers both hit and value: the key rides in the
-            // slot's top 43 bits, the merged ID in the low 21. The empty
-            // sentinel's key field (u64::MAX >> 21) exceeds every real
-            // 42-bit key, so it never false-hits.
             if slot >> PAIR_ID_BITS == key {
                 return (slot & ((1 << PAIR_ID_BITS) - 1)) as u32;
             }
@@ -249,27 +187,19 @@ impl PairRankTable {
         }
     }
 
-    /// `prefetcht0` the first line [`Self::rank`] would load for `(a, b)`:
-    /// the dense cell when both sides sit in the grid, else the first
-    /// sparse probe slot. The short-merge loop's refresh lookups sit on a
-    /// serial dependency chain and their slot-load consumers are ~5-7% of
-    /// cold cycles on Zen 5 (profiling/zen5_st_profile.md §4.3); both
-    /// refresh pairs are known before the list surgery, so issuing their
-    /// prefetches first overlaps the load latency with the surgery and
-    /// with each other. Address math mirrors `rank` exactly (same bounds:
-    /// dense idx < dense.len(), slot idx < slots.len() via `shift`), so
-    /// every prefetched address lies within the table's allocations.
-    /// x86_64 only; a no-op elsewhere (aarch64 uses the NEON merge core).
+    /// `prefetcht0` the first line [`Self::rank`] would load for `(a, b)`.
+    /// The short merge's refresh lookups sit on a serial chain; both refresh
+    /// pairs are known before the list surgery, so their loads can overlap
+    /// it. x86_64 only (aarch64 uses the NEON core).
     #[inline(always)]
     pub(crate) fn prefetch_rank(&self, a: TokenId, b: TokenId) {
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: `_mm_prefetch` does not dereference; both index
-        // computations are the bounded ones from `rank` (see its SAFETY
-        // comments), so the address stays inside the live allocation.
+        // SAFETY: `_mm_prefetch` does not dereference; the index math is
+        // `rank`'s, so the address stays inside the live allocation.
         unsafe {
             use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let addr = if (a.0 | b.0) >> self.dense_log2 == 0 {
-                let idx = ((a.0 as usize) << self.dense_log2) | b.0 as usize;
+            let addr = if (a.0 | b.0) >> DENSE_LOG2 == 0 {
+                let idx = ((a.0 as usize) << DENSE_LOG2) | b.0 as usize;
                 self.dense.as_ptr().add(idx) as *const i8
             } else {
                 let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
@@ -283,13 +213,8 @@ impl PairRankTable {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared BPE merge functions
-// ---------------------------------------------------------------------------
-
-/// Reusable scratch buffers for [`bpe_merge_symbols_with_scratch`]. Holding one
-/// of these across calls means the hot encode loop performs no per-pretoken
-/// allocations for the linked list or the merge heap.
+/// Reusable scratch buffers for [`bpe_merge_symbols_with_scratch`], so the
+/// miss path performs no per-pretoken allocations.
 #[derive(Default)]
 pub struct MergeScratch {
     next: Vec<u32>,
@@ -297,19 +222,15 @@ pub struct MergeScratch {
     heap: Vec<std::cmp::Reverse<u64>>,
 }
 
-/// Pack a heap entry as `(merged_token << 32) | position`. `u64` ordering then
-/// matches the old `(TokenId, usize)` tuple ordering (token ID first, position
-/// as tie-break) while halving the element size the heap has to shuffle.
+/// Pack a heap entry as `(rank << 32) | position`: rank first, position
+/// as tie-break, in half the element size of a tuple.
 #[inline(always)]
-fn pack_merge_entry(merged: TokenId, pos: u32) -> u64 {
-    ((merged.0 as u64) << 32) | pos as u64
+fn pack_merge_entry(rank: u32, pos: u32) -> u64 {
+    ((rank as u64) << 32) | pos as u64
 }
 
-/// Apply BPE merges to an already-initialized symbol sequence.
-/// Priority is determined by the merged token's ID (lower = first).
-/// This is correct for tiktoken-style tokenizers where vocab ID equals merge rank.
-///
-/// Uses a min-heap + doubly-linked list for O(n log n) performance.
+/// Apply BPE merges to a symbol sequence; priority is the merged token's
+/// ID (lower = first), as for tiktoken-style vocabularies.
 pub fn bpe_merge_symbols<S: std::hash::BuildHasher>(
     merges: &HashMap<(TokenId, TokenId), TokenId, S>,
     symbols: &mut Vec<TokenId>,
@@ -317,9 +238,7 @@ pub fn bpe_merge_symbols<S: std::hash::BuildHasher>(
     bpe_merge_symbols_with_scratch(merges, symbols, &mut MergeScratch::default());
 }
 
-/// Like [`bpe_merge_symbols`], but reuses caller-provided scratch buffers so
-/// repeated calls (one per cache-missing pretoken) do not allocate. Merges
-/// `symbols` in place.
+/// [`bpe_merge_symbols`] with caller-provided scratch buffers.
 pub fn bpe_merge_symbols_with_scratch<S: std::hash::BuildHasher>(
     merges: &HashMap<(TokenId, TokenId), TokenId, S>,
     symbols: &mut Vec<TokenId>,
@@ -332,15 +251,38 @@ pub fn bpe_merge_symbols_with_scratch<S: std::hash::BuildHasher>(
     );
 }
 
-/// Shared merge loop, generic over the pair-rank lookup: `get_rank` returns
-/// the merged token's ID (== merge priority for tiktoken-style vocabs) or
-/// `u32::MAX` when the pair does not merge.
-// Out of line: this only runs on pretoken-cache misses (~0.7% of
-// pretokens on OWT), and inlining its bulk into the encode loop costs
-// more in I-cache and register pressure there than a call costs here.
+/// Id-as-rank merge, dispatching on size: `get_rank` returns the merged
+/// token's ID (== merge priority) or `u32::MAX` for no merge. Out of line:
+/// it only runs on cache misses.
 #[inline(never)]
 pub(crate) fn bpe_merge_symbols_by_rank(
     get_rank: &impl Fn(TokenId, TokenId) -> u32,
+    symbols: &mut Vec<TokenId>,
+    scratch: &mut MergeScratch,
+) {
+    let n = symbols.len();
+    if n < 2 {
+        return;
+    }
+    if n <= SMALL_MERGE_MAX {
+        bpe_merge_symbols_small(get_rank, symbols);
+        return;
+    }
+    bpe_merge_symbols_heap(
+        &|a, b| {
+            let rank = get_rank(a, b);
+            (TokenId(rank), rank)
+        },
+        symbols,
+        scratch,
+    );
+}
+
+/// Min-heap + doubly-linked-list merge for n > SMALL_MERGE_MAX, O(n log n).
+/// `get` returns `(merged, rank)`, rank `u32::MAX` = no merge; lowest rank
+/// first, then lowest position.
+fn bpe_merge_symbols_heap(
+    get: &impl Fn(TokenId, TokenId) -> (TokenId, u32),
     symbols: &mut Vec<TokenId>,
     scratch: &mut MergeScratch,
 ) {
@@ -348,19 +290,7 @@ pub(crate) fn bpe_merge_symbols_by_rank(
     use std::collections::BinaryHeap;
 
     let n = symbols.len();
-    if n < 2 {
-        return;
-    }
-
-    // For short sequences (the overwhelming majority of pretokens), a linear
-    // rank scan has far lower constants than heap + linked list.
-    if n <= SMALL_MERGE_MAX {
-        bpe_merge_symbols_small(get_rank, symbols);
-        return;
-    }
-
-    // Doubly-linked list via u32 index arrays (pretokens are far shorter than
-    // 2^32 symbols).
+    // Doubly-linked list via u32 index arrays.
     const NONE: u32 = u32::MAX;
     let next = &mut scratch.next;
     let prev = &mut scratch.prev;
@@ -371,35 +301,29 @@ pub(crate) fn bpe_merge_symbols_by_rank(
     prev.push(NONE);
     prev.extend(0..n as u32 - 1);
 
-    // Min-heap of packed (merged_token_id, position). Lower ID = higher
-    // priority. Seed with all initial pairs, then heapify in O(n) instead of
-    // pushing one at a time.
+    // Min-heap of packed (rank, position), heapified in O(n).
     let mut seeds = std::mem::take(&mut scratch.heap);
     seeds.clear();
     for i in 0..n - 1 {
-        let m = get_rank(symbols[i], symbols[i + 1]);
-        if m != u32::MAX {
-            seeds.push(Reverse(pack_merge_entry(TokenId(m), i as u32)));
+        let (_, rank) = get(symbols[i], symbols[i + 1]);
+        if rank != u32::MAX {
+            seeds.push(Reverse(pack_merge_entry(rank, i as u32)));
         }
     }
     let mut heap: BinaryHeap<Reverse<u64>> = BinaryHeap::from(seeds);
 
     while let Some(Reverse(entry)) = heap.pop() {
         let pos = (entry & u32::MAX as u64) as usize;
-        let expected_merged = (entry >> 32) as u32;
-        // Validate: pos must still be active and its right neighbor must exist
+        let expected_rank = (entry >> 32) as u32;
         let right = next[pos];
         if right == NONE {
             continue;
         }
         let right = right as usize;
-        // Check the pair still matches (it may have been invalidated by an
-        // earlier merge). A no-merge result (u32::MAX) never equals the
-        // expected merged ID, since only real merges are pushed.
-        let merged = get_rank(symbols[pos], symbols[right]);
-        if merged == expected_merged {
-            // Apply the merge
-            symbols[pos] = TokenId(merged);
+        // Stale entries (invalidated by an earlier merge) no longer match.
+        let (merged, rank) = get(symbols[pos], symbols[right]);
+        if rank == expected_rank {
+            symbols[pos] = merged;
             let right_right = next[right];
             next[pos] = right_right;
             if right_right != NONE {
@@ -409,19 +333,17 @@ pub(crate) fn bpe_merge_symbols_by_rank(
             // `right`; nothing reads `prev[right]` once it is unlinked.
             next[right] = NONE;
 
-            // Re-check pair with left neighbor
             let left = prev[pos];
             if left != NONE {
-                let m = get_rank(symbols[left as usize], symbols[pos]);
-                if m != u32::MAX {
-                    heap.push(Reverse(pack_merge_entry(TokenId(m), left)));
+                let (_, rank) = get(symbols[left as usize], symbols[pos]);
+                if rank != u32::MAX {
+                    heap.push(Reverse(pack_merge_entry(rank, left)));
                 }
             }
-            // Re-check pair with new right neighbor
             if next[pos] != NONE {
-                let m = get_rank(symbols[pos], symbols[next[pos] as usize]);
-                if m != u32::MAX {
-                    heap.push(Reverse(pack_merge_entry(TokenId(m), pos as u32)));
+                let (_, rank) = get(symbols[pos], symbols[next[pos] as usize]);
+                if rank != u32::MAX {
+                    heap.push(Reverse(pack_merge_entry(rank, pos as u32)));
                 }
             }
         }
@@ -429,9 +351,8 @@ pub(crate) fn bpe_merge_symbols_by_rank(
     // The pop loop drained the heap; keep its capacity for the next call.
     scratch.heap = heap.into_vec();
 
-    // Compact surviving symbols in place. Surviving indices are strictly
-    // increasing and the k-th survivor has index >= k, so writes never
-    // overtake reads.
+    // Compact survivors in place: their indices are strictly increasing,
+    // so writes never overtake reads.
     let mut write = 0;
     let mut i = 0;
     loop {
@@ -448,29 +369,20 @@ pub(crate) fn bpe_merge_symbols_by_rank(
 /// Sequences up to this length use the linear-scan merge instead of the heap.
 const SMALL_MERGE_MAX: usize = 32;
 
-/// BPE merge for short sequences (n <= SMALL_MERGE_MAX), in the style of
-/// tiktoken's `byte_pair_merge`: keep a per-position rank (the merged token ID
-/// of the pair starting there, or `u32::MAX`), find the minimum by linear scan,
-/// merge, and recompute only the two affected neighbor ranks. The scan over a
-/// few stack-resident `u32`s beats a `BinaryHeap`'s sift traffic at these
-/// sizes, and merge priority (lowest merged ID, then lowest position) is
-/// identical to the heap version's ordering.
-///
-/// One of three deliberately separate small-merge cores with disjoint
-/// domains: this Vec-based one handles 16..=32 symbols via
-/// `bpe_merge_symbols_by_rank` (the long-pretoken miss path); pretokens of
-/// <= 15 symbols go straight to `bpe_merge_symbols_short_scalar` /
-/// `bpe_merge_symbols_short_neon`. Unifying them was measured as a
-/// regression risk to the tuned short-miss path.
+/// BPE merge for n <= SMALL_MERGE_MAX in the style of tiktoken's
+/// `byte_pair_merge`: per-position ranks, linear min scan, merge, refresh
+/// the two neighbor ranks. Same priority order (lowest ID, then lowest
+/// position) as the heap loop. Vec-based core for the 16..=32-symbol
+/// long-miss path; see `bpe_merge_symbols_short_scalar` for why the cores
+/// stay separate.
 fn bpe_merge_symbols_small(
     get_rank: &impl Fn(TokenId, TokenId) -> u32,
     symbols: &mut Vec<TokenId>,
 ) {
     let n = symbols.len();
     debug_assert!((2..=SMALL_MERGE_MAX).contains(&n));
-    // Stack-resident doubly-linked list, so a merge is O(1) pointer updates
-    // instead of shifting the tail (which lowers to a libc memmove call).
-    // Sentinels: next[last] == n, prev[0] == u8::MAX; both fail `< n` checks.
+    // Stack-resident doubly-linked list. Sentinels: next[last] == n,
+    // prev[0] == u8::MAX; both fail `< n` checks.
     let mut next = [0u8; SMALL_MERGE_MAX];
     let mut prev = [0u8; SMALL_MERGE_MAX];
     for i in 0..n {
@@ -496,7 +408,7 @@ fn bpe_merge_symbols_small(
             break;
         }
         let i = best_i;
-        symbols[i] = TokenId::from(best);
+        symbols[i] = TokenId(best);
         // Unlink the right element of the merged pair.
         let dead = next[i] as usize;
         let new_right = next[dead] as usize;
@@ -530,21 +442,11 @@ fn bpe_merge_symbols_small(
 /// ≤ 15 bytes, so at most 15 initial symbols.
 pub(crate) const SHORT_MERGE_MAX: usize = 16;
 
-/// [`bpe_merge_symbols_small`] over a caller-owned stack array instead of
-/// the `Vec` scratch (no bounds/capacity code, no extend memmove) — the
-/// short-pretoken miss path's merge. Returns the merged length.
-///
-/// The non-aarch64 core of the short-miss domain (<= 15 symbols, called
-/// from the tiktoken encode loop); aarch64 uses
-/// [`bpe_merge_symbols_short_neon`] when a [`PairRankTable`] is available.
-/// Kept separate from the Vec-based [`bpe_merge_symbols_small`] (16..=32
-/// symbols): the domains are disjoint and unification was measured as a
-/// regression risk to this tuned miss path.
-///
-/// `prefetch_rank` is [`PairRankTable::prefetch_rank`] when a table backs
-/// `get_rank`, and a no-op closure for the HashMap fallback — the merge
-/// scan itself stays identical either way (restructuring it was measured
-/// negative; the prefetch only reorders when the refresh loads issue).
+/// [`bpe_merge_symbols_small`] over a caller-owned stack array — the
+/// short-pretoken (<= 15 symbols) miss path's merge. Returns the merged
+/// length. The three small cores (this, `_short_neon`, and the Vec-based
+/// `_small`) are deliberately separate: unifying them measured as a
+/// regression. `prefetch_rank` is a no-op closure on the HashMap fallback.
 pub(crate) fn bpe_merge_symbols_short_scalar(
     get_rank: impl Fn(TokenId, TokenId) -> u32,
     prefetch_rank: impl Fn(TokenId, TokenId),
@@ -578,16 +480,9 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
             break;
         }
         let i = best_i;
-        // Both refresh pairs are fixed the moment `best` is chosen:
-        // (best, symbols[new_right]) and (symbols[left], best). Their rank
-        // lines are the serial chain's next loads (their consumers are
-        // ~5-7% of cold cycles, profiling/zen5_st_profile.md §4.3), so
-        // request both before the list surgery. List indices are strictly
-        // increasing, so new_right > i and the surgery's `prev[new_right]`
-        // store cannot alias `prev[i]` — reading `left` early is safe.
-        // `symbols[new_right]` / `symbols[left]` are read only behind the
-        // same `< n` guards the refresh uses: active positions holding
-        // live tokens, never garbage lanes.
+        // Both refresh pairs are known now, so request their rank lines
+        // before the list surgery. Reading `left` early is safe: new_right
+        // > i, so the `prev[new_right]` store cannot alias `prev[i]`.
         let dead = next[i] as usize;
         let new_right = next[dead] as usize;
         let left = prev[i] as usize;
@@ -626,23 +521,11 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
 
 /// [`bpe_merge_symbols_short_scalar`] with a branchless NEON min-rank scan.
 /// Rank and position share one lane, `pr[i] = (rank << 8) | i`, so the
-/// vector minimum selects the lowest rank with ties broken by the lowest
-/// position — exactly the scalar scan's order. Real ranks are < 2^21 (a
-/// [`PairRankTable`] build invariant, which is why this variant requires
-/// one), so packed lanes are < 2^29 and "no merge" (`u32::MAX << 8`, from
-/// the wrapping shift of the MAX sentinel) sorts above every real lane.
-/// The scan covers 16 lanes with inactive lanes parked at `u32::MAX` —
-/// four loads, three `vmin`s, one `vminv`, zero data-dependent branches on
-/// a core where the scalar scan's `rank < best` mispredicts freely. Every
-/// live lane index is `< n` (pairs start below `n` and merges only clear
-/// lanes), so when `n <= 8` the scan reads just the first two vectors —
-/// the width branch is hoisted out of the loop and fixed per call.
-///
-/// The aarch64 core of the short-miss domain (<= 15 symbols, called from
-/// the tiktoken encode loop); other arches use
-/// [`bpe_merge_symbols_short_scalar`], and 16..=32-symbol sequences take
-/// the Vec-based [`bpe_merge_symbols_small`] — the three are deliberately
-/// not unified (disjoint domains; see `bpe_merge_symbols_short_scalar`).
+/// vector minimum picks the lowest rank, then the lowest position — the
+/// scalar scan's order. Ranks are < 2^21 (a [`PairRankTable`] invariant,
+/// hence the table parameter), so packed lanes are < 2^29 and "no merge"
+/// (`u32::MAX << 8`) sorts above every real lane. Inactive lanes stay at
+/// `u32::MAX`; live lane indices are `< n`, so `n <= 8` reads two vectors.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn bpe_merge_symbols_short_neon(
     table: &PairRankTable,
@@ -667,9 +550,6 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     for i in 0..n - 1 {
         pr[i] = pack(table.rank(symbols[i], symbols[i + 1]), i);
     }
-    // Lanes at index >= n stay u32::MAX forever (initial pairs sit below
-    // n - 1; the loop below only writes lanes < n), so short pretokens
-    // need only the first half of the scan.
     let narrow = n <= 8;
     loop {
         // SAFETY: pr is 16 contiguous u32s; vld1q_u32 has no alignment
@@ -718,180 +598,6 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     write
 }
 
-/// AVX-512 port of [`bpe_merge_symbols_short_neon`]: the whole 4-load,
-/// 3-`vmin`, 1-`vminv` scan collapses to one 64-byte `pr` load and one
-/// `vpminud` reduction tree — all 16 lanes in a single zmm, so there is no
-/// narrow/wide split to hoist (lanes at index >= n are parked at
-/// `u32::MAX` and never win). Packing, list surgery, and tie-break order
-/// are identical to the NEON and scalar variants (see
-/// [`bpe_merge_symbols_short_neon`] for the lane-packing invariants).
-///
-/// NOT dispatched by the miss path: measured ~1% slower than the scalar
-/// scan on cold encode_st (Zen 5 / 9800X3D, gpt2, 100 MB and 1 GB OWT,
-/// interleaved min-of-5, runtime-dispatched baseline build). The x86
-/// horizontal reduce is a 4-dependent-op chain plus a vector→GPR `vmovd`
-/// on the merge loop's serial chain, the `target_feature` boundary costs
-/// a real call per short merge (NEON needs no gate and inlines), and the
-/// scalar scan's `rank < best` branch predicts well on Zen 5 at typical
-/// n ≈ 4-6 — the mispredict pressure that made the NEON scan win on M4
-/// is absent. Kept, with the AVX2 tier below, as a tested reference
-/// (differential-covered by `short_merges_match_vec_merge_loop`); see
-/// profiling/x86_port_plan.md §6.
-#[cfg(target_arch = "x86_64")]
-#[cfg_attr(not(test), allow(dead_code))]
-#[target_feature(enable = "avx512f")]
-fn bpe_merge_symbols_short_avx512(
-    table: &PairRankTable,
-    symbols: &mut [TokenId; SHORT_MERGE_MAX],
-    n: usize,
-) -> usize {
-    use core::arch::x86_64::{_mm512_loadu_si512, _mm512_reduce_min_epu32};
-    debug_assert!((2..=SHORT_MERGE_MAX - 1).contains(&n));
-    /// Every packed value at or above this has rank u32::MAX (no merge).
-    const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
-    let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
-    let mut next = [0u8; SHORT_MERGE_MAX];
-    let mut prev = [0u8; SHORT_MERGE_MAX];
-    for i in 0..n {
-        next[i] = (i + 1) as u8;
-        prev[i] = (i as u8).wrapping_sub(1);
-    }
-    // pr[i] = packed (rank, position) of the pair starting at active
-    // position i; the only array the scan reads.
-    let mut pr = [u32::MAX; SHORT_MERGE_MAX];
-    for i in 0..n - 1 {
-        pr[i] = pack(table.rank(symbols[i], symbols[i + 1]), i);
-    }
-    loop {
-        // SAFETY: pr is 16 contiguous u32s (64 bytes); the unaligned-load
-        // intrinsic has no alignment requirement.
-        let best = unsafe {
-            _mm512_reduce_min_epu32(_mm512_loadu_si512(pr.as_ptr() as *const _))
-        };
-        if best >= NO_MERGE_FLOOR {
-            break;
-        }
-        let i = (best & 0xFF) as usize;
-        symbols[i] = TokenId(best >> 8);
-        // Unlink the right element of the merged pair.
-        let dead = next[i] as usize;
-        let new_right = next[dead] as usize;
-        next[i] = new_right as u8;
-        pr[dead] = u32::MAX;
-        // Refresh the two pairs now touching the merged symbol.
-        if new_right < n {
-            prev[new_right] = i as u8;
-            pr[i] = pack(table.rank(symbols[i], symbols[new_right]), i);
-        } else {
-            pr[i] = u32::MAX;
-        }
-        let left = prev[i] as usize;
-        if left < n {
-            pr[left] = pack(table.rank(symbols[left], symbols[i]), left);
-        }
-    }
-    // Compact survivors in place.
-    let mut write = 0;
-    let mut i = 0;
-    while i < n {
-        symbols[write] = symbols[i];
-        write += 1;
-        i = next[i] as usize;
-    }
-    write
-}
-
-/// AVX2 tier of the short merge (Haswell+, Zen 1-3): two 32-byte `pr`
-/// loads and one `vpminud`, then a 4-step horizontal min (extract + 3
-/// shuffled mins) in place of NEON's `vminv`. The NEON narrow split is
-/// kept: `n <= 8` reads one ymm and skips the cross-vector min. Packing,
-/// list surgery, and tie-break order are identical to the other variants.
-///
-/// NOT dispatched — same measured-slower verdict as the AVX-512 tier
-/// above (whose doc has the numbers and the why).
-#[cfg(target_arch = "x86_64")]
-#[cfg_attr(not(test), allow(dead_code))]
-#[target_feature(enable = "avx2")]
-fn bpe_merge_symbols_short_avx2(
-    table: &PairRankTable,
-    symbols: &mut [TokenId; SHORT_MERGE_MAX],
-    n: usize,
-) -> usize {
-    use core::arch::x86_64::*;
-    debug_assert!((2..=SHORT_MERGE_MAX - 1).contains(&n));
-    /// Every packed value at or above this has rank u32::MAX (no merge).
-    const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
-    let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
-    let mut next = [0u8; SHORT_MERGE_MAX];
-    let mut prev = [0u8; SHORT_MERGE_MAX];
-    for i in 0..n {
-        next[i] = (i + 1) as u8;
-        prev[i] = (i as u8).wrapping_sub(1);
-    }
-    // pr[i] = packed (rank, position) of the pair starting at active
-    // position i; the only array the scan reads.
-    let mut pr = [u32::MAX; SHORT_MERGE_MAX];
-    for i in 0..n - 1 {
-        pr[i] = pack(table.rank(symbols[i], symbols[i + 1]), i);
-    }
-    // Lanes at index >= n stay u32::MAX forever, so short pretokens need
-    // only the first ymm of the scan; the width branch is hoisted out of
-    // the loop and fixed per call.
-    let narrow = n <= 8;
-    loop {
-        // SAFETY: pr is 16 contiguous u32s; unaligned loads.
-        let best = unsafe {
-            let p = pr.as_ptr() as *const __m256i;
-            let m = if narrow {
-                _mm256_loadu_si256(p)
-            } else {
-                _mm256_min_epu32(_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1)))
-            };
-            // Horizontal min of 8 u32 lanes: fold 256 -> 128, then two
-            // shuffled mins; lane 0 holds the minimum.
-            let m128 = _mm_min_epu32(
-                _mm256_castsi256_si128(m),
-                _mm256_extracti128_si256::<1>(m),
-            );
-            let m128 = _mm_min_epu32(m128, _mm_shuffle_epi32::<0b01_00_11_10>(m128));
-            let m128 = _mm_min_epu32(m128, _mm_shuffle_epi32::<0b00_00_00_01>(m128));
-            _mm_cvtsi128_si32(m128) as u32
-        };
-        if best >= NO_MERGE_FLOOR {
-            break;
-        }
-        let i = (best & 0xFF) as usize;
-        symbols[i] = TokenId(best >> 8);
-        // Unlink the right element of the merged pair.
-        let dead = next[i] as usize;
-        let new_right = next[dead] as usize;
-        next[i] = new_right as u8;
-        pr[dead] = u32::MAX;
-        // Refresh the two pairs now touching the merged symbol.
-        if new_right < n {
-            prev[new_right] = i as u8;
-            pr[i] = pack(table.rank(symbols[i], symbols[new_right]), i);
-        } else {
-            pr[i] = u32::MAX;
-        }
-        let left = prev[i] as usize;
-        if left < n {
-            pr[left] = pack(table.rank(symbols[left], symbols[i]), left);
-        }
-    }
-    // Compact survivors in place.
-    let mut write = 0;
-    let mut i = 0;
-    while i < n {
-        symbols[write] = symbols[i];
-        write += 1;
-        i = next[i] as usize;
-    }
-    write
-}
-
 /// Vocabulary entries as `(id, bytes)` pairs in ID order, skipping IDs with
 /// no assigned content. Shared by both tokenizer types' `vocab_entries`.
 pub(crate) fn vocab_entries(
@@ -904,29 +610,52 @@ pub(crate) fn vocab_entries(
         .map(|(id, bytes)| (id as u32, bytes.as_ref()))
 }
 
-/// Pack a ranked-merge pair key into one `u64`: hashing it is a single
-/// multiply instead of a two-round tuple hash, and the merge loop probes this
-/// map ~2x per symbol.
+/// Pack a ranked-merge pair key into one `u64`: a single-multiply hash
+/// instead of a two-round tuple hash, probed ~2x per symbol.
 #[inline(always)]
 pub fn ranked_merge_key(a: TokenId, b: TokenId) -> u64 {
     ((a.0 as u64) << 32) | b.0 as u64
 }
 
+/// Explicit merge-priority table: `ranked_merge_key(a, b)` → `(merged, rank)`.
+pub type RankedMerges = HashMap<u64, (TokenId, u32), rustc_hash::FxBuildHasher>;
+
+/// Merge rules of a ranked table as `(left, right)` byte pairs in rank order.
+pub(crate) fn ranked_merge_entries<'a>(
+    rm: &RankedMerges,
+    vocab: &'a [std::sync::Arc<[u8]>],
+) -> Vec<(&'a [u8], &'a [u8])> {
+    let mut ranked: Vec<(u64, u32)> = rm.iter().map(|(&key, &(_, rank))| (key, rank)).collect();
+    ranked.sort_unstable_by_key(|&(_, rank)| rank);
+    ranked
+        .into_iter()
+        .map(|(key, _)| {
+            (
+                vocab[(key >> 32) as usize].as_ref(),
+                vocab[key as u32 as usize].as_ref(),
+            )
+        })
+        .collect()
+}
+
 /// Ranked-merge variant of [`bpe_merge_symbols_small`]: allocation-free BPE
-/// for short symbol sequences (the overwhelming majority of cache-missing
-/// units), with priority taken from the merge table's explicit rank. Also
-/// the stack-buffer miss path of the ByteLevel tokenizer for rank-mapped
-/// vocabularies (see `ranked_merges` there). Merges `symbols` in place and
-/// returns the surviving count; the caller truncates or slices to it.
+/// for short symbol sequences with priority from the table's explicit rank.
+/// `(merged, rank)` for a pair, or rank `u32::MAX` for no merge.
+#[inline(always)]
+fn ranked_get<S: std::hash::BuildHasher>(
+    merges: &HashMap<u64, (TokenId, u32), S>,
+    a: TokenId,
+    b: TokenId,
+) -> (TokenId, u32) {
+    merges.get(&ranked_merge_key(a, b)).map_or((TokenId(0), u32::MAX), |&m| m)
+}
+
+/// Merges `symbols` in place and returns the surviving count.
 pub(crate) fn bpe_merge_symbols_ranked_slice<S: std::hash::BuildHasher>(
     merges: &HashMap<u64, (TokenId, u32), S>,
     symbols: &mut [TokenId],
 ) -> usize {
-    let get = |a: TokenId, b: TokenId| -> (TokenId, u32) {
-        merges
-            .get(&ranked_merge_key(a, b))
-            .map_or((TokenId::from(0u32), u32::MAX), |&m| m)
-    };
+    let get = |a, b| ranked_get(merges, a, b);
     let n = symbols.len();
     debug_assert!((2..=SMALL_MERGE_MAX).contains(&n));
     // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
@@ -939,7 +668,7 @@ pub(crate) fn bpe_merge_symbols_ranked_slice<S: std::hash::BuildHasher>(
     // For the pair starting at active position i: its merge priority and
     // merged token. Rank u32::MAX = no merge (or merged away).
     let mut ranks = [u32::MAX; SMALL_MERGE_MAX];
-    let mut merged = [TokenId::from(0u32); SMALL_MERGE_MAX];
+    let mut merged = [TokenId(0); SMALL_MERGE_MAX];
     for i in 0..n - 1 {
         (merged[i], ranks[i]) = get(symbols[i], symbols[i + 1]);
     }
@@ -985,141 +714,53 @@ pub(crate) fn bpe_merge_symbols_ranked_slice<S: std::hash::BuildHasher>(
     write
 }
 
-/// Apply BPE merges using explicit merge ranks for priority (lower rank = first).
-/// The merge table maps `(token_a, token_b) → (merged_token, rank)`.
-///
-/// Uses a min-heap + doubly-linked list for O(n log n) performance instead of
-/// the naive O(n × merges) scan.
-/// This is only needed by SentencePiece-style tokenizers.
+/// Apply BPE merges with explicit ranks (`(a, b) → (merged, rank)`, lower
+/// rank first), as SentencePiece-style tokenizers need.
 pub fn bpe_merge_symbols_ranked<S: std::hash::BuildHasher>(
     merges: &HashMap<u64, (TokenId, u32), S>,
     symbols: &mut Vec<TokenId>,
 ) {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
     let n = symbols.len();
     if n < 2 {
         return;
     }
-
-    // Short sequences (the overwhelming majority of word units) skip the
-    // heap and its allocations entirely.
     if n <= SMALL_MERGE_MAX {
         let new_len = bpe_merge_symbols_ranked_slice(merges, symbols);
         symbols.truncate(new_len);
         return;
     }
-
-    // Doubly-linked list via index arrays. NONE = no neighbor.
-    const NONE: usize = usize::MAX;
-    let mut next: Vec<usize> = (1..n).chain(std::iter::once(NONE)).collect();
-    let mut prev: Vec<usize> = std::iter::once(NONE).chain(0..n - 1).collect();
-    let mut token = symbols.clone();
-
-    // Min-heap of (rank, position). Position refers to the left symbol of the pair.
-    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
-
-    // Seed with all initial pairs
-    let mut i = 0;
-    while i < n {
-        let j = next[i];
-        if j == NONE {
-            break;
-        }
-        if let Some(&(_, rank)) = merges.get(&ranked_merge_key(token[i], token[j])) {
-            heap.push(Reverse((rank, i)));
-        }
-        i = j;
-    }
-
-    while let Some(Reverse((rank, pos))) = heap.pop() {
-        // Validate: pos must still be active and its right neighbor must exist
-        let right = next[pos];
-        if right == NONE {
-            continue;
-        }
-        // Check the pair still matches (it may have been invalidated by an earlier merge)
-        let pair = ranked_merge_key(token[pos], token[right]);
-        match merges.get(&pair) {
-            Some(&(merged_token, r)) if r == rank => {
-                // Apply the merge: replace token[pos], remove right
-                token[pos] = merged_token;
-                let right_right = next[right];
-                next[pos] = right_right;
-                if right_right != NONE {
-                    prev[right_right] = pos;
-                }
-                // Mark right as deleted
-                next[right] = NONE;
-                prev[right] = NONE;
-
-                // Re-check pair with left neighbor
-                let left = prev[pos];
-                if left != NONE
-                    && let Some(&(_, rank)) = merges.get(&ranked_merge_key(token[left], token[pos])) {
-                        heap.push(Reverse((rank, left)));
-                    }
-                // Re-check pair with new right neighbor
-                if next[pos] != NONE
-                    && let Some(&(_, rank)) = merges.get(&ranked_merge_key(token[pos], token[next[pos]])) {
-                        heap.push(Reverse((rank, pos)));
-                    }
-            }
-            _ => continue, // Stale entry, skip
-        }
-    }
-
-    // Collect surviving symbols via linked list traversal
-    symbols.clear();
-    let mut i = 0;
-    // Find the head (first element with prev == NONE that's still in the list)
-    // Since we never remove index 0's prev link, index 0 is always the head
-    loop {
-        symbols.push(token[i]);
-        if next[i] == NONE {
-            break;
-        }
-        i = next[i];
-    }
+    bpe_merge_symbols_heap(&|a, b| ranked_get(merges, a, b), symbols, &mut MergeScratch::default());
 }
 
-/// Tokenize a single pretoken by mapping each byte to TokenId(byte_value)
-/// then applying BPE merges (priority by merged token ID).
-pub fn simple_bpe_merge<S: std::hash::BuildHasher>(
-    merges: &HashMap<(TokenId, TokenId), TokenId, S>,
-    pre_token: &[u8],
-) -> Vec<TokenId> {
-    let mut symbols: Vec<TokenId> = pre_token.iter().map(|&b| TokenId::from(b as u32)).collect();
-    bpe_merge_symbols(merges, &mut symbols);
-    symbols
-}
-
-// Re-export the main types so existing `use crate::bpe::Tokenizer` still works.
 pub use sentencepiece::SentencePieceBPE;
 pub use tiktoken::Tokenizer;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_util {
+    /// xorshift64: deterministic, dependency-free RNG for test inputs.
+    pub(crate) struct XorShift64(pub u64);
 
-    /// Minimal deterministic RNG (xorshift64*) so the differential tests
-    /// need no dev-dependency.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
+    impl XorShift64 {
+        pub(crate) fn next_u64(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            self.0
         }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
+
+        pub(crate) fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::XorShift64;
+    use super::*;
 
     fn random_merges(
-        rng: &mut Rng,
+        rng: &mut XorShift64,
         n_merges: usize,
         id_range: u32,
     ) -> HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher> {
@@ -1136,10 +777,10 @@ mod tests {
     /// and return the no-merge sentinel everywhere else.
     #[test]
     fn pair_rank_table_matches_map() {
-        let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+        let mut rng = XorShift64(0x1234_5678_9ABC_DEF0);
         let id_range = 4096u32;
         let merges = random_merges(&mut rng, 3000, id_range);
-        let table = PairRankTable::build(&merges, None, id_range as usize).expect("build");
+        let table = PairRankTable::build(&merges, id_range as usize).expect("build");
         for (&(a, b), &m) in &merges {
             assert_eq!(table.rank(a, b), m.0, "pair ({}, {})", a.0, b.0);
         }
@@ -1150,10 +791,10 @@ mod tests {
             assert_eq!(table.rank(a, b), expected, "pair ({}, {})", a.0, b.0);
         }
         // Oversized IDs must refuse the table, not corrupt it.
-        assert!(PairRankTable::build(&merges, None, (1 << PAIR_ID_BITS) + 1).is_none());
+        assert!(PairRankTable::build(&merges, (1 << PAIR_ID_BITS) + 1).is_none());
         let mut big = merges.clone();
         big.insert((TokenId(1 << PAIR_ID_BITS), TokenId(0)), TokenId(300));
-        assert!(PairRankTable::build(&big, None, id_range as usize).is_none());
+        assert!(PairRankTable::build(&big, id_range as usize).is_none());
     }
 
     /// The stack-array short merges (scalar and NEON) must produce exactly
@@ -1161,12 +802,11 @@ mod tests {
     /// same tie-breaks — across random symbol sequences and merge tables.
     #[test]
     fn short_merges_match_vec_merge_loop() {
-        let mut rng = Rng(0xDEAD_BEEF_0BAD_F00D);
+        let mut rng = XorShift64(0xDEAD_BEEF_0BAD_F00D);
         for trial in 0..2000 {
             let id_range = 300 + (trial % 7) as u32 * 500;
             let merges = random_merges(&mut rng, 200 + trial % 800, id_range);
-            let table =
-                PairRankTable::build(&merges, None, id_range as usize + 1024).expect("build");
+            let table = PairRankTable::build(&merges, id_range as usize + 1024).expect("build");
             let n = 2 + rng.below(14) as usize; // 2..=15
             let init: Vec<TokenId> = (0..n)
                 .map(|_| TokenId(rng.below(id_range as u64) as u32))
@@ -1192,26 +832,31 @@ mod tests {
                 let len = bpe_merge_symbols_short_neon(&table, &mut neon, n);
                 assert_eq!(&neon[..len], &reference[..], "neon diverged: {init:?}");
             }
+        }
+    }
 
-            // Exercise both x86 tiers explicitly (not just the dispatcher's
-            // pick) so an AVX-512 box still validates the AVX2 arm.
-            #[cfg(target_arch = "x86_64")]
-            {
-                if std::arch::is_x86_feature_detected!("avx512f") {
-                    let mut v = [TokenId(0); SHORT_MERGE_MAX];
-                    v[..n].copy_from_slice(&init);
-                    // SAFETY: runtime AVX-512F detection right above.
-                    let len = unsafe { bpe_merge_symbols_short_avx512(&table, &mut v, n) };
-                    assert_eq!(&v[..len], &reference[..], "avx512 diverged: {init:?}");
-                }
-                if std::arch::is_x86_feature_detected!("avx2") {
-                    let mut v = [TokenId(0); SHORT_MERGE_MAX];
-                    v[..n].copy_from_slice(&init);
-                    // SAFETY: runtime AVX2 detection right above.
-                    let len = unsafe { bpe_merge_symbols_short_avx2(&table, &mut v, n) };
-                    assert_eq!(&v[..len], &reference[..], "avx2 diverged: {init:?}");
-                }
-            }
+    /// The ranked cores (small slice + heap) must agree with the id-as-rank
+    /// cores on a table whose rank is the merged ID, for n in both regimes.
+    #[test]
+    fn ranked_and_id_as_rank_cores_agree() {
+        let mut rng = XorShift64(0x5EED_1234_ABCD_0001);
+        let mut scratch = MergeScratch::default();
+        for trial in 0..1000 {
+            let id_range = 300 + (trial % 5) as u32 * 400;
+            let merges = random_merges(&mut rng, 200 + trial % 600, id_range);
+            let ranked: RankedMerges = merges
+                .iter()
+                .map(|(&(a, b), &m)| (ranked_merge_key(a, b), (m, m.0)))
+                .collect();
+            let n = 2 + rng.below(63) as usize; // 2..=64
+            let init: Vec<TokenId> = (0..n)
+                .map(|_| TokenId(rng.below(id_range as u64) as u32))
+                .collect();
+            let mut reference = init.clone();
+            bpe_merge_symbols_with_scratch(&merges, &mut reference, &mut scratch);
+            let mut got = init.clone();
+            bpe_merge_symbols_ranked(&ranked, &mut got);
+            assert_eq!(got, reference, "n={n}: {init:?}");
         }
     }
 }

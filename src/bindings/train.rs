@@ -3,10 +3,8 @@
 
 use super::sources::FileSource;
 use crate::bpe_train;
-use crate::input::file_source::FileSourceSpec;
-use crate::input::{MmappedFile, Resource};
+use crate::input::file_source::{DocFormat, FileSourceSpec, detect_default_format};
 use crate::pretokenize;
-use itertools::Itertools;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict};
 use std::path::PathBuf;
@@ -24,8 +22,8 @@ fn bpe_result_to_python<'py>(
     let vocab_py = result
         .vocab
         .into_iter()
-        .map(|(k, v)| (k, PyBytes::new(py, &v)))
-        .sorted_by(|e1, e2| Ord::cmp(&e1.0, &e2.0))
+        .enumerate()
+        .map(|(id, v)| (id as u32, PyBytes::new(py, &v)))
         .into_py_dict(py);
     let merges_py: Vec<_> = result
         .merges
@@ -47,7 +45,6 @@ fn parse_tie_breaking(s: &str) -> PyResult<bpe_train::TieBreaking> {
 }
 
 #[pyfunction]
-#[allow(clippy::type_complexity)]
 #[pyo3(signature = (in_data, vocab_size, special_tokens, tie_breaking = "huggingface", separator = None))]
 pub(crate) fn train_bpe<'py>(
     py: Python<'py>,
@@ -56,10 +53,7 @@ pub(crate) fn train_bpe<'py>(
     special_tokens: Vec<String>,
     tie_breaking: &str,
     separator: Option<&[u8]>,
-) -> PyResult<(
-    Bound<'py, PyDict>,
-    Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
-)> {
+) -> PyResult<PyVocabAndMerges<'py>> {
     assert!(
         vocab_size <= 2_usize.pow(32),
         "vocab_size must be less than 2^32"
@@ -67,59 +61,28 @@ pub(crate) fn train_bpe<'py>(
     let tie_breaking = parse_tie_breaking(tie_breaking)?;
     let separator = separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR);
 
-    // --- FileSource: multi-file parallel processing ---
-    if let Ok(file_source) = in_data.extract::<FileSource>() {
-        let spec = FileSourceSpec {
-            paths: file_source.paths,
-            format: file_source.format,
-        };
-        let counts = spec.pretokenize().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                "FileSource processing failed: {}",
-                e
-            ))
-        })?;
+    let spec = if let Ok(file_source) = in_data.extract::<FileSource>() {
+        FileSourceSpec { paths: file_source.paths, format: file_source.format }
+    } else if let Ok(bytes) = in_data.extract::<&[u8]>() {
+        let counts = pretokenize::pretokenize_par_bytes(bytes, separator);
         let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
         return bpe_result_to_python(py, result);
-    }
-
-    // --- Single bytes or file path ---
-    let mmap_resource;
-    let bytes: &[u8] = if in_data.is_instance_of::<PyBytes>() {
-        in_data.extract::<&[u8]>()?
     } else if let Ok(path) = in_data.extract::<PathBuf>() {
-        if let Some(ext) = path.extension()
-            && ext == "parquet"
-        {
-            // A bare path takes the default column "text", matching
-            // detect_default_format; use ParquetFileSource to choose another
-            // column.
-            let spec = FileSourceSpec {
-                paths: vec![path],
-                format: crate::input::file_source::DocFormat::Parquet {
-                    column: "text".to_string(),
-                },
-            };
-            let counts = spec
-                .pretokenize()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
-            return bpe_result_to_python(py, result);
-        }
-        mmap_resource = MmappedFile::open(&path).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                "Failed to open file {:?}: {}",
-                path, e
-            ))
-        })?;
-        mmap_resource.as_bytes()
+        // A bare text path splits on `separator`; .jsonl/.parquet paths take
+        // their default field/column.
+        let format = match detect_default_format(&path) {
+            DocFormat::Text { .. } => DocFormat::Text { separator: Some(separator.to_vec()) },
+            other => other,
+        };
+        FileSourceSpec { paths: vec![path], format }
     } else {
         return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
             "in_data must be bytes, a path, or a FileSource",
         ));
     };
-
-    let counts = pretokenize::pretokenize_par_bytes(bytes, separator);
+    let counts = spec
+        .pretokenize()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
     let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
     bpe_result_to_python(py, result)
 }

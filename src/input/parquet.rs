@@ -1,11 +1,7 @@
 //! Parquet input: one document per row, text taken from a string or binary
-//! column. Parquet pages are decoded through the arrow reader, so documents
-//! are materialized as owned buffers rather than borrowed from an mmap like
-//! the byte-stream formats. Null rows become empty documents so results
-//! stay row-aligned with the source table. Row groups are the parallel work
-//! units; documents always come back in row order.
+//! column (null rows become empty documents). Rows are materialized as
+//! owned buffers; row groups are the parallel work units.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -17,9 +13,8 @@ use arrow_schema::DataType;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use rayon::prelude::*;
-use rustc_hash::FxBuildHasher;
 
-use crate::pretokenize::pretokenize_as_iter;
+use crate::input::{PretokenCounts, count_pretokens, merge_counts};
 
 fn parquet_err(path: &Path, err: impl std::fmt::Display) -> io::Error {
     io::Error::new(
@@ -160,31 +155,15 @@ pub fn read_docs(path: &Path, column: &str, parallel: bool) -> io::Result<Vec<Ve
 }
 
 /// Parallel pretokenization of `column`, one rayon task per row group.
-/// Documents are visited batch-by-batch without materializing the file.
-pub fn pretokenize_par(
-    path: &Path,
-    column: &str,
-) -> io::Result<HashMap<Vec<u8>, usize, FxBuildHasher>> {
+pub fn pretokenize_par(path: &Path, column: &str) -> io::Result<PretokenCounts> {
     (0..n_row_groups(path)?)
         .into_par_iter()
         .map(|rg| {
-            let mut counts: HashMap<Vec<u8>, usize, FxBuildHasher> = HashMap::default();
-            for_each_doc(path, column, Some(vec![rg]), |doc| {
-                for pretoken in pretokenize_as_iter(doc) {
-                    *counts.entry(pretoken.as_ref().to_vec()).or_default() += 1;
-                }
-            })?;
+            let mut counts = PretokenCounts::default();
+            for_each_doc(path, column, Some(vec![rg]), |doc| count_pretokens(&mut counts, doc))?;
             Ok(counts)
         })
-        .try_reduce(HashMap::default, |mut acc, counts| {
-            if acc.is_empty() {
-                return Ok(counts);
-            }
-            for (k, v) in counts {
-                *acc.entry(k).or_default() += v;
-            }
-            Ok(acc)
-        })
+        .try_reduce(PretokenCounts::default, |acc, counts| Ok(merge_counts(acc, counts)))
 }
 
 #[cfg(test)]
@@ -195,8 +174,8 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
 
-    /// Write a single-row-group-capped parquet file with a nullable string
-    /// "text" column, a binary "raw" column, and an int "id" column.
+    /// A parquet file with a nullable string "text" column, a binary "raw"
+    /// column, and an int "id" column, capped rows per row group.
     fn write_fixture(path: &Path, texts: &[Option<&str>], max_row_group_size: usize) {
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("id", DataType::Int64, false),
@@ -292,11 +271,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("docs.parquet");
         write_fixture(&path, &TEXTS, 2);
-        let mut expected: HashMap<Vec<u8>, usize, FxBuildHasher> = HashMap::default();
+        let mut expected = PretokenCounts::default();
         for doc in expected_docs() {
-            for pretoken in pretokenize_as_iter(&doc) {
-                *expected.entry(pretoken.as_ref().to_vec()).or_default() += 1;
-            }
+            count_pretokens(&mut expected, &doc);
         }
         assert_eq!(pretokenize_par(&path, "text").unwrap(), expected);
     }

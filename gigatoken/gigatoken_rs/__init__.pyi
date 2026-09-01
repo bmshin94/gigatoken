@@ -63,7 +63,11 @@ def train_bpe(
     special_tokens: list[str],
     tie_breaking: str = "huggingface",
     separator: bytes | None = None,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]: ...
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Train a BPE vocabulary. `in_data` is raw bytes, a path (plain text
+    split on `separator`, default `<|endoftext|>`; .jsonl takes the "text"
+    field and .parquet the "text" column; .gz/.zst are decompressed), or a
+    FileSource. Returns (vocab, merges)."""
 
 class PadTruncate:
     """How encode_batch_padded assembles rows into a rectangular matrix; see

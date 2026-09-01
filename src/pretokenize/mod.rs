@@ -1,31 +1,23 @@
 //! Pretokenization: split documents into pretokens following a tokenizer's
 //! pretokenization regex.
 //!
-//! The production implementations live in `fast` (one submodule per scheme:
+//! The implementations live in `fast` (one submodule per scheme:
 //! `fast::r50k` for GPT-2, `fast::cl100k` for GPT-4, ...), selected via
-//! [`PretokenizerType`]. Superseded designs (state machine, combinator,
-//! SIMD prototypes) live in [`reference`] as benchmark baselines and test
-//! oracles — nothing there runs in the encode path.
+//! [`PretokenizerType`].
 //!
 //! The main entry points are:
 //! - `pretokenize_as_iter`: iterate pretokens of a `&[u8]` (r50k scheme)
 //! - `PretokenizerType::pretokenize`: iterate pretokens of any scheme
-//! - `Pretokenize` trait: `doc.pretokens()` on any `&[u8]`
 //! - `pretokenize_par_bytes`: parallel pretokenization with document splitting and counting
 
 pub(crate) use crate::pretokenize::pretoken::Pretoken;
-use crate::pretokenize::pretokenize_traits::{
-    ParallelMergeCounts, PretokenCountable,
-};
-use crate::input::Resource;
+use crate::input::par_document_chunks;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
 pub mod fast;
 mod options;
 mod pretoken;
-pub(crate) mod pretokenize_traits;
-pub mod reference;
 mod unicode;
 
 pub use fast::{
@@ -33,7 +25,6 @@ pub use fast::{
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
 };
 pub use options::{FastPretokenizerDispatch, PretokenizerType};
-pub use reference::state_machine::PretokenizerIter;
 
 /// Default document separator used in common training corpora.
 pub const DEFAULT_SEPARATOR: &[u8] = b"<|endoftext|>";
@@ -44,23 +35,15 @@ pub fn pretokenize_as_iter(bytes: &[u8]) -> FastR50kPretokenizer<'_> {
     FastR50kPretokenizer::new(bytes)
 }
 
-// ---------------------------------------------------------------------------
 // Batched pretoken pulling (the encode loop's input interface)
-// ---------------------------------------------------------------------------
 
 /// Chunk size of [`PretokenSpans::fill_spans_keyed`] — the live entries of
 /// one [`SpanBatch`] fill.
 pub const PRETOKEN_CHUNK: usize = 256;
 
-/// Both 64-bit halves of the per-length pack mask, in scalar ALU ops. A
-/// u128 `MAX >> s` lowers to a multi-instruction sequence and the 16-entry
-/// table this replaces put a dependent L1 load (2.43% of process) on the
-/// `n → key → store` chain; per-half variable shifts are single 1-cycle
-/// ops, so the halves cost two independent 3-deep chains and no load port.
-/// The length tag (`n << 120`) touches only the high half and is OR'd in
-/// by the caller. `const`: the phase-B emission loop's `PACK_MASK_TABLE`
-/// (see `fast::mask`) is built from this at compile time, so the ALU and
-/// table forms cannot drift apart.
+/// Both 64-bit halves of the per-length pack mask in scalar ALU ops, for
+/// the latency-chained per-span paths (a dependent table load measured
+/// worse there); `fast::mask::PACK_MASK_TABLE` is built from this `const fn`.
 #[inline(always)]
 pub(crate) const fn pack_mask_halves(n: usize) -> (u64, u64) {
     debug_assert!(n >= 1 && n <= 15);
@@ -70,24 +53,16 @@ pub(crate) const fn pack_mask_halves(n: usize) -> (u64, u64) {
     (lo, hi)
 }
 
-// The key packers below (`pack_pretoken_key`, `fill_spans_keyed_with_buf`,
-// phase B of the two-phase walker) read span bytes as native-endian words
-// and mask, and the emit loop stores packed token lanes as one native-endian
-// word — all little-endian layouts. A big-endian build would silently
-// produce wrong keys and swapped tokens, so refuse to compile instead.
+// Key packing and token-lane stores read/write native-endian words and
+// assume little-endian layouts.
 #[cfg(target_endian = "big")]
 compile_error!("gigatoken's key packing and token-lane stores assume little-endian byte order");
 
 /// Pack a pretoken of ≤ 15 bytes into a `u128` cache key: bytes in the low
-/// 15 lanes, length in the top byte (so keys of different lengths never
-/// collide, and a real key is never 0). Returns `None` for longer
-/// pretokens, which use the slice-keyed fallback map.
-///
-/// The common path is a single unaligned 16-byte load followed by a mask,
-/// avoiding both a variable-length `memcpy` and per-byte branching. The
-/// load is only taken when it cannot cross a page boundary, so it can
-/// never touch an unmapped page; the rare near-boundary case falls back to
-/// a plain copy. Both paths produce the identical key.
+/// 15 lanes, length in the top byte (so keys never collide across lengths
+/// and a real key is never 0). `None` for longer pretokens (slice-keyed
+/// fallback map). One unaligned 16-byte load + mask when the load cannot
+/// cross a page boundary, else a plain copy; both give the identical key.
 #[inline(always)]
 pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
     let n = bytes.len();
@@ -95,11 +70,7 @@ pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
         return None;
     }
     if n == 0 {
-        // Empty pretokens (possible through the public API, never from a
-        // pretokenizer) pack to key 0, which the short table reserves as
-        // its empty sentinel — the encode loop routes key 0 to the long
-        // map. Also keeps the read below from touching a zero-length
-        // slice's dangling pointer.
+        // Empty pretokens (public API only) take key 0, the long-map route.
         return Some(0);
     }
     let p = bytes.as_ptr();
@@ -121,33 +92,19 @@ pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
     Some(low | ((n as u128) << 120))
 }
 
-/// Hash of a packed pretoken key. Quality is noncritical for correctness
-/// (the table compares full keys), but every consumer — the fill loops
-/// (`fill_spans_keyed_with{,_buf}`, `fill_spans_two_phase`),
-/// `ShortPretokenCache::grow`'s rehash, and the vocab-seeding paths
-/// (`seeded_pretoken_cache`, `add_special_token`, `fork_sized`) — must
-/// compute the same function of the key: the arms below produce different
-/// values and may never mix in one process image. On aarch64 the arm is
-/// picked at compile time; on x86_64 it is picked per process by
-/// [`crc_hash_selected`], an immutable pure function of the CPU — this
-/// entry point branches on that bit (cheap at the cold/slow sites that
-/// use it, including the test-only [`fill_spans_keyed_with`]), and the
-/// two hot fill loops instead embed one arm per monomorphization,
-/// dispatched once per fill on the same bit (see [`fill_span_hash`]), so
-/// the same key always hashes the same way. All
-/// arms map key 0 to hash 0, which the fill loops' long-pretoken route
-/// stores.
+/// Hash of a packed pretoken key. Every consumer (fill loops, cache
+/// rehash, vocab seeding) must hash a key the same way: the arms below
+/// differ and may never mix in one process. aarch64 picks its arm at
+/// compile time; x86_64 per process via [`crc_hash_selected`] (the hot
+/// fill loops embed one arm per monomorphization, see [`fill_span_hash`]).
+/// Every arm maps key 0 to hash 0.
 #[inline(always)]
 pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
-    // Note: `crc` is in the default feature set for aarch64-apple-darwin
-    // but NOT for aarch64-unknown-linux-gnu — generic aarch64 Linux builds
-    // need `-C target-feature=+crc` (e.g. via RUSTFLAGS) to get this fast
-    // hash; without it they silently take the multiply fold below.
+    // aarch64-unknown-linux-gnu needs `-C target-feature=+crc` for this arm.
     #[cfg(all(target_arch = "aarch64", target_feature = "crc"))]
     {
-        // Hardware CRC32: two 3-cycle ops replace the 5-op multiply fold.
-        // Linear over GF(2), so the low bits (the table index) see every
-        // key bit; 32 bits suffice for any table under 2^32 slots.
+        // Hardware CRC32: linear over GF(2), so the low bits (the table
+        // index) see every key bit.
         use core::arch::aarch64::__crc32d;
         // SAFETY: gated on the `crc` target feature at compile time.
         unsafe { __crc32d(__crc32d(0, key as u64), (key >> 64) as u64) as u64 }
@@ -168,10 +125,8 @@ pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
     }
 }
 
-/// The multiply-fold arm of [`pretoken_key_hash`]: one folded multiply,
-/// the cheapest mix whose low bits still see every key bit. Every target
-/// can execute it; it is the process's hash wherever no hardware CRC arm
-/// applies. Maps key 0 to hash 0 (0 · M = 0).
+/// The multiply-fold arm of [`pretoken_key_hash`], used wherever no
+/// hardware CRC arm applies. Maps key 0 to hash 0.
 #[allow(dead_code)] // no cfg arm references it under aarch64 + crc
 #[inline(always)]
 fn pretoken_key_hash_fold(key: u128) -> u64 {
@@ -182,26 +137,14 @@ fn pretoken_key_hash_fold(key: u128) -> u64 {
     h
 }
 
-/// The hardware CRC32C (SSE4.2) arm of [`pretoken_key_hash`]: same shape
-/// and rationale as the aarch64 CRC32 arm — linear over GF(2) so the low
-/// bits (the table index) see every key bit, 3-cycle latency and one µop
-/// per `crc32` on Zen 2 (two chained ops vs the 5-op multiply fold), and
-/// `_mm_crc32_u64(0, 0) == 0` preserves the key 0 -> hash 0 property the
-/// fill loops' long-pretoken route stores.
-///
-/// `sse4.2` is NOT in baseline x86-64, so distributed wheels cannot gate
-/// this arm at compile time; it is instead selected per process by
-/// [`crc_hash_selected`] and reached only through call sites guarded by
-/// that bit. Builds with `sse4.2` statically enabled (`-C
-/// target-cpu=znver2`, any x86-64-v2+ setting) fold the guards away and
-/// keep the pure-CRC codegen of a compile-time arm.
+/// The hardware CRC32C (SSE4.2) arm of [`pretoken_key_hash`]. `sse4.2` is
+/// not baseline x86-64, so it is selected per process by
+/// [`crc_hash_selected`] rather than at compile time.
 ///
 /// # Safety
 ///
-/// The CPU must support SSE4.2: callers reach this only after
-/// [`crc_hash_selected`] returned true (directly, or structurally via a
-/// `fill_span_hash::<true>` monomorphization — see its contract), or from
-/// a build with `sse4.2` statically enabled.
+/// The CPU must support SSE4.2: reached only after [`crc_hash_selected`]
+/// returned true, directly or via a `fill_span_hash::<true>` instantiation.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 #[inline]
@@ -213,13 +156,8 @@ unsafe fn pretoken_key_hash_crc32c(key: u128) -> u64 {
 }
 
 /// Does this process hash pretoken keys with CRC32C (x86_64)? A pure
-/// function of the CPU, so one immutable answer for the process lifetime:
-/// [`pretoken_key_hash`] and every fill-loop dispatch branch on this same
-/// bit, which is what keeps the one-hash-per-process invariant airtight
-/// without a per-key runtime check in the hot loops. std caches the
-/// CPUID result, so after the first call this is a relaxed atomic load +
-/// bit test; builds with `sse4.2` statically enabled const-fold it to
-/// `true`.
+/// function of the CPU, so every hash site branching on it agrees for the
+/// process lifetime. A cached atomic load after the first call.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) fn crc_hash_selected() -> bool {
@@ -227,32 +165,19 @@ pub(crate) fn crc_hash_selected() -> bool {
 }
 
 /// Per-span hash for the monomorphized fill-loop bodies:
-/// [`pretoken_key_hash`] with the x86_64 per-process selection hoisted
-/// out of the per-span path. On x86_64 the two instantiations embed one
-/// arm each, and each is reachable only under the matching value of
-/// [`crc_hash_selected`]:
-///
-/// - `X86_CRC = true` bodies are called exclusively from the
-///   `#[target_feature(enable = "sse4.2")]` fill wrappers, which their
-///   dispatchers enter only when `crc_hash_selected()` is true;
-/// - `X86_CRC = false` bodies are called exclusively from the dispatchers'
-///   other arm, i.e. only when `crc_hash_selected()` is false (with
-///   `sse4.2` statically enabled that arm is statically dead).
-///
-/// So every instantiation agrees with what [`pretoken_key_hash`] returns
-/// for the same key in the same process. Off x86_64 the parameter is
-/// ignored and this IS [`pretoken_key_hash`].
+/// [`pretoken_key_hash`] with the x86_64 per-process selection hoisted out
+/// of the per-span path. Reachability rule: `X86_CRC = true` is
+/// instantiated only inside the sse4.2-gated fill wrappers, entered only
+/// when [`crc_hash_selected`]; `false` only on the other dispatch arm. Off
+/// x86_64 this IS [`pretoken_key_hash`].
 #[inline(always)]
 pub(crate) fn fill_span_hash<const X86_CRC: bool>(key: u128) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         if X86_CRC {
-            // Reachability contract: only the sse4.2-gated fill wrappers
-            // instantiate `X86_CRC = true`, so the selection bit must hold.
             debug_assert!(crc_hash_selected());
             // SAFETY: the `true` instantiation is only reachable from the
-            // sse4.2-gated fill wrappers (see the contract above), so the
-            // CPU has SSE4.2.
+            // sse4.2-gated fill wrappers (reachability rule above).
             unsafe { pretoken_key_hash_crc32c(key) }
         } else {
             pretoken_key_hash_fold(key)
@@ -265,30 +190,16 @@ pub(crate) fn fill_span_hash<const X86_CRC: bool>(key: u128) -> u64 {
 }
 
 /// One batch slot: a pretoken span with its packed cache key and key hash,
-/// as one 32-byte record (half a cache line, never straddling one thanks
-/// to the alignment).
-///
-/// AoS instead of the previous three parallel arrays for dataflow on both
-/// sides: the fill loops store one record with two `stp`s on a single
-/// store stream (the parallel arrays cost 4 store µops across 3 streams —
-/// the split u128 key store alone was two), and the probe loop's per-`i`
-/// `(key, hash)` read touches one cache line instead of three.
-///
-/// `meta` carries the field the consumer needs next, keyed on `key`:
-/// - `key != 0` (short pretoken, ≤ 15 bytes): `meta` is the full 64-bit
-///   key hash. The span length rides in the key's top byte, so `ptr` +
-///   `key >> 120` reconstructs the span on the (rare) slow path.
+/// as one 32-byte record (AoS: one store stream per fill, one cache line
+/// per probe). `meta` is keyed on `key`:
+/// - `key != 0` (short pretoken, ≤ 15 bytes): the full 64-bit key hash;
+///   the span length rides in the key's top byte.
 /// - `key == 0` (long pretoken, or an empty span through the public
-///   adapter): `meta` is the span length in bytes. The hash is not stored:
-///   the long route never probes the short table, and
-///   `pretoken_key_hash(0) == 0` is what the old layout recorded anyway.
-///   Prefetching `meta` as if it were a hash touches an arbitrary
-///   (masked, in-bounds) table line — harmless, long pretokens are rare.
+///   adapter): the span length in bytes (the long route never probes the
+///   short table; prefetching it as a hash is harmless).
 ///
 /// Fields are `pub(crate)`: only the in-crate fill loops may write entries
-/// (safe external writes of an arbitrary `ptr`/`key` would let safe code
-/// drive [`SpanBatch::span`]'s `from_raw_parts` with garbage — see the
-/// [`PretokenSpans`] safety contract).
+/// (see the [`PretokenSpans`] safety contract).
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
 pub(crate) struct BatchEntry {
@@ -308,17 +219,13 @@ impl BatchEntry {
 }
 
 /// Readable slack entries past a full chunk, so the emit loop's
-/// prefetch-ahead `entries[i + D].meta` load needs no index clamp (a
-/// per-pretoken `add + cmp + csel` in the hottest loop). Slack entries
-/// are never written by a fill; prefetching a stale or zero `meta`
-/// requests an arbitrary masked (in-bounds) table line — harmless.
+/// prefetch-ahead `entries[i + D].meta` load needs no index clamp (never
+/// written by a fill; a stale prefetch is harmless).
 pub(crate) const SPAN_BATCH_SLACK: usize = 16;
 
-/// One chunk of pretoken spans with their packed cache keys (0 = longer
-/// than 15 bytes, routed to the slice-keyed fallback map) and key hashes,
-/// filled by [`PretokenSpans::fill_spans_keyed`]. See [`BatchEntry`] for
-/// the record layout. Fills only ever write the first [`PRETOKEN_CHUNK`]
-/// entries; the tail is prefetch slack (see [`SPAN_BATCH_SLACK`]).
+/// One chunk of pretoken spans with their packed cache keys and hashes
+/// ([`BatchEntry`]), filled by [`PretokenSpans::fill_spans_keyed`]. Fills
+/// only ever write the first [`PRETOKEN_CHUNK`] entries.
 pub struct SpanBatch<'a> {
     /// `pub(crate)`: writable only by the in-crate fill loops, which uphold
     /// the [`PretokenSpans`] safety contract on every entry they write.
@@ -356,17 +263,10 @@ impl Default for SpanBatch<'_> {
 }
 
 /// A source of pretoken spans, pulled a chunk at a time with their cache
-/// keys derived on the way out.
-///
-/// `Tokenizer::memoized_encode` consumes pretokens through this instead of
-/// `Iterator` for codegen reasons: pulling happens in a dedicated
-/// out-of-line loop, so the pretokenizer state is register-allocated
-/// across the whole chunk (inlined into the register-starved encode loop
-/// it lives in stack slots, ~9 cycles/pretoken of spill traffic on Zen 2).
-/// Key packing, hashing, and the cache-line prefetch ride along in the
-/// same loop because the span walker is a serial dependency chain (IPC
-/// ~1.7 standalone): the independent per-span key math fills its idle
-/// issue slots nearly for free, where a separate pass paid for it in full.
+/// keys derived on the way out. `Tokenizer::memoized_encode` uses this
+/// instead of `Iterator` so pulling happens in a dedicated out-of-line
+/// loop where the pretokenizer state stays register-allocated, and the
+/// key math fills the serial span walker's idle issue slots.
 ///
 /// # Safety
 ///
@@ -383,33 +283,19 @@ impl Default for SpanBatch<'_> {
 ///   those bytes via `pack_pretoken_key`/`pretoken_key_hash` semantics.
 ///
 /// The entry fields are `pub(crate)`, so implementations outside this
-/// crate cannot write entries at all and can only soundly return 0; the
-/// in-crate fill helpers (`fill_spans_keyed_with{,_buf}`,
-/// `fill_spans_two_phase`) uphold the contract.
+/// crate cannot write entries at all and can only soundly return 0.
 pub unsafe trait PretokenSpans<'a> {
     /// Fill `batch` from the front with the next pretoken spans, calling
     /// `prefetch(hash)` for each. Returns how many were written; a short
-    /// count (including 0) means the input is exhausted. (Recomputing the
-    /// hash at the consumer instead of storing it here measured 4% slower
-    /// end to end: the extra multiply sits on the probe loop's critical
-    /// path, while this loop has store slots to spare.)
+    /// count (including 0) means the input is exhausted. (Storing the hash
+    /// rather than recomputing it at the consumer measured 4% faster.)
     fn fill_spans_keyed(&mut self, batch: &mut SpanBatch<'a>, prefetch: &impl Fn(u64)) -> usize;
 }
 
 /// Shared body of the iterator-backed [`PretokenSpans`] implementations
-/// (spans with no single backing buffer): pull spans from `next` and derive
-/// each one's key, hash, and prefetch on the way out. `#[inline(always)]`
-/// so each `#[inline(never)]` implementation fuses it with its span walker
-/// into a single out-of-line loop (see the trait docs for why that fusion
-/// matters). Sources that walk one backing slice use
-/// [`fill_spans_keyed_with_buf`] instead.
-///
-/// No production caller walks this path — the concrete pretokenizers and
-/// the dispatch enum all fill through [`fill_spans_keyed_with_buf`] or
-/// `fast::fill_spans_two_phase` — so unlike those two, it takes no
-/// CRC-monomorphized wrapper: [`pretoken_key_hash`]'s per-span dispatch
-/// branch (same process-immutable [`crc_hash_selected`] bit, so hash
-/// values agree with every other site) is irrelevant off the hot path.
+/// (spans with no single backing buffer; sources that walk one slice use
+/// [`fill_spans_keyed_with_buf`]). No production caller walks this path,
+/// so it takes no CRC-monomorphized wrapper.
 #[inline(always)]
 pub(crate) fn fill_spans_keyed_with<'a>(
     mut next: impl FnMut() -> Option<&'a [u8]>,
@@ -434,20 +320,9 @@ pub(crate) fn fill_spans_keyed_with<'a>(
 }
 
 /// [`fill_spans_keyed_with`] for span sources that walk a single backing
-/// slice, with `next` yielding `(start, end)` byte offsets into `bytes`.
-/// Knowing the buffer removes the two data-dependent branches of
-/// [`pack_pretoken_key`] from the per-span path:
-///
-/// - the `> 15` long-pretoken route becomes a select — for a long span the
-///   16-byte load sits entirely inside the span, so it needs no guard, and
-///   the select (not the mask clamp) provides the key-0 routing;
-/// - the per-span page-boundary check (mispredict-prone: ~0.4% of spans on
-///   4 KiB pages) becomes one buffer-end bound, hoisted per fill and false
-///   only for short spans starting in the last 15 bytes of `bytes` — once
-///   per input, so the branch predicts ~perfectly.
-///
-/// Empty spans cannot occur (`next` contract: `start < end`), so the key-0
-/// route is exactly "longer than 15 bytes", as in the fallible packer.
+/// slice, with `next` yielding `(start, end)` (`start < end`) into `bytes`.
+/// Knowing the buffer turns [`pack_pretoken_key`]'s two data-dependent
+/// branches into a select and one hoisted buffer-end bound.
 #[inline(always)]
 pub(crate) fn fill_spans_keyed_with_buf<'a>(
     bytes: &'a [u8],
@@ -455,7 +330,7 @@ pub(crate) fn fill_spans_keyed_with_buf<'a>(
     batch: &mut SpanBatch<'a>,
     prefetch: &impl Fn(u64),
 ) -> usize {
-    // Hash-arm dispatch, once per fill — see [`fill_spans_keyed_with`].
+    // Hash-arm dispatch, once per fill (see `fill_span_hash`).
     #[cfg(target_arch = "x86_64")]
     if crc_hash_selected() {
         // SAFETY: `crc_hash_selected` verified SSE4.2 support.
@@ -530,13 +405,10 @@ fn fill_spans_keyed_with_buf_impl<'a, const X86_CRC: bool>(
     n
 }
 
-/// Adapter giving any pretoken iterator (reference pretokenizers, tests,
-/// custom sources) the [`PretokenSpans`] interface. The `Fast*`
-/// pretokenizers implement the trait directly over their walker state
-/// instead (see `fast::fill_spans_keyed_mask`): routing them through
-/// `Iterator::next` left the (large, `#[inline(always)]`) `next_span`
-/// un-inlined behind a real call — measured cost in
-/// `fast::fill_spans_keyed_mask`'s docs.
+/// Adapter giving any pretoken iterator the [`PretokenSpans`] interface.
+/// The `Fast*` pretokenizers implement the trait directly over their
+/// walker state instead (routing them through `Iterator::next` measured
+/// ~23% of warm encode time in call overhead).
 pub struct SpanIter<I>(pub I);
 
 // SAFETY: delegates to `fill_spans_keyed_with`, which writes exactly the
@@ -548,58 +420,26 @@ unsafe impl<'a, I: Iterator<Item = Pretoken<'a>>> PretokenSpans<'a> for SpanIter
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pretokenize trait — Layer 3
-// ---------------------------------------------------------------------------
-
-/// Anything that can be split into a stream of pretokens.
-pub trait Pretokenize {
-    fn pretokens(&self) -> FastR50kPretokenizer<'_>;
-}
-
-impl Pretokenize for [u8] {
-    fn pretokens(&self) -> FastR50kPretokenizer<'_> {
-        pretokenize_as_iter(self)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Pretoken-safe document splitting
-// ---------------------------------------------------------------------------
 
 /// Split `bytes` into ranges of roughly `target` bytes whose boundaries are
 /// pretoken boundaries under every supported pretokenization scheme, so
 /// encoding the ranges independently and concatenating the token streams is
 /// identical to encoding `bytes` in one pass.
 ///
-/// A boundary sits on a space that is preceded by an ASCII alphanumeric and
-/// followed by an ASCII letter ("…word word…"). No scheme's pretoken can
-/// cross such a point: whitespace only attaches to adjacent pretokens as a
-/// single *leading* space of a following word (` ?\p{L}+` and friends), and
-/// the only trailing attachments are `[\r\n]*`, which cannot contain a
-/// space. Letter/digit runs cannot contain a space either, and the
-/// all-whitespace rules (`\s+(?!\S)`, `\s*[\r\n]+`, …) never see a run that
-/// crosses the boundary because the preceding byte is alphanumeric. The
-/// three ASCII bytes also cannot sit inside a multi-byte UTF-8 character.
+/// A boundary sits on a space preceded by an ASCII alphanumeric and
+/// followed by an ASCII letter. No scheme's pretoken can cross such a
+/// point: whitespace attaches only as a single leading space of a
+/// following word, trailing attachments (`[\r\n]*`) contain no space, and
+/// the all-whitespace rules never see a run crossing it.
 ///
-/// `added_tokens` are the byte sequences matched atomically *before*
-/// pretokenization (see `Tokenizer::encode_with_added_tokens`), each paired
-/// with its `rstrip` flag; a candidate boundary is rejected when an
-/// occurrence of one straddles it, since the halves would otherwise be
-/// BPE-encoded as plain text. Only tokens that contain a space can ever
-/// straddle a boundary (every boundary sits on a space byte), so for typical
-/// vocabularies the check costs nothing. If no occurrence crosses a
-/// boundary, greedy leftmost-longest matching restarted there reproduces the
-/// single-pass matches: the matcher's only state is its scan position, and
-/// no match can carry it across the boundary.
-///
-/// An `rstrip` token absorbs the whitespace after its match, so a boundary
-/// is also rejected when such an occurrence ends exactly at it — the space
-/// opening the next chunk would encode as plain text instead of being
-/// absorbed. (`lstrip` needs no counterpart: a boundary space preceding a
-/// match lands at the start of the next chunk and is trimmed identically
-/// there, and a boundary can never sit inside a longer whitespace run
-/// because the byte before it must be alphanumeric.)
+/// `added_tokens` (byte sequence, `rstrip` flag) are matched atomically
+/// before pretokenization, so a boundary is rejected when an occurrence
+/// straddles it (only tokens containing a space can) or when an `rstrip`
+/// occurrence ends exactly at it (the boundary space would otherwise
+/// encode as plain text instead of being absorbed). `lstrip` needs no
+/// counterpart: a boundary space before a match is trimmed identically at
+/// the start of the next chunk.
 pub fn safe_split_ranges(
     bytes: &[u8],
     target: usize,
@@ -659,9 +499,7 @@ pub fn safe_split_ranges(
     out
 }
 
-// ---------------------------------------------------------------------------
 // Parallel pretokenization with document splitting
-// ---------------------------------------------------------------------------
 
 /// Pretokenize `bytes` in parallel, splitting documents on `separator`.
 /// Returns a map of pretoken → count.
@@ -669,56 +507,43 @@ pub fn pretokenize_par_bytes<'a>(
     bytes: &'a [u8],
     separator: &'a [u8],
 ) -> HashMap<Pretoken<'a>, usize, rustc_hash::FxBuildHasher> {
-    let start_time = std::time::Instant::now();
-    let n_threads = rayon::current_num_threads();
-    eprintln!("Using {n_threads} threads for pretokenization");
-
-    let chunks = bytes.par_document_chunks(separator, n_threads);
-
-    let merged_counts = chunks
+    let chunks = par_document_chunks(bytes, separator, rayon::current_num_threads());
+    chunks
         .into_par_iter()
-        .map(|doc_iter| {
-            doc_iter
-                .flat_map(|doc| doc.pretokens())
-                .pretoken_count()
+        .map(|docs| {
+            let mut counts = HashMap::default();
+            for doc in docs {
+                for p in FastR50kPretokenizer::new(doc) {
+                    *counts.entry(p).or_default() += 1;
+                }
+            }
+            counts
         })
-        .par_merge_counts();
-
-    let time_elapsed = start_time.elapsed();
-    eprintln!("Pretokenization took {time_elapsed:?}");
-
-    merged_counts
+        .reduce(HashMap::default, |mut acc, m| {
+            if acc.is_empty() {
+                return m;
+            }
+            for (k, v) in m {
+                *acc.entry(k).or_default() += v;
+            }
+            acc
+        })
 }
-
 
 #[cfg(test)]
 mod test {
-    use itertools::Itertools;
-    use std::fs;
-
     use super::*;
+    use fast::test_support::{assert_matches_regex, load_owt_prefix};
 
     const GPT2_REGEX: &str =
         r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
-
-    /// Load the first `max_bytes` of ~/data/owt_train.txt, truncated to a UTF-8 boundary.
-    fn load_owt(max_bytes: usize) -> Vec<u8> {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let all_bytes =
-            fs::read(data_dir.join("owt_train.txt")).expect("Could not read ~/data/owt_train.txt");
-        let mut end = max_bytes.min(all_bytes.len());
-        while end > 0 && std::str::from_utf8(&all_bytes[..end]).is_err() {
-            end -= 1;
-        }
-        all_bytes[..end].to_vec()
-    }
 
     /// `safe_split_ranges` must produce boundaries that no pretoken crosses,
     /// for every supported scheme: pretokenizing the ranges independently and
     /// concatenating must equal pretokenizing the whole input in one pass.
     #[test]
     fn test_safe_split_ranges_pretoken_equivalent() {
-        let input = load_owt(2_000_000);
+        let input = load_owt_prefix(2_000_000);
 
         let ranges = safe_split_ranges(&input, 10_000, &[]);
         assert!(ranges.len() > 100, "expected many splits, got {}", ranges.len());
@@ -831,86 +656,13 @@ mod test {
         );
     }
 
-    /// Compare the production (fast r50k) pretokenizer against the GPT-2
-    /// reference regex on ~5 MB of OWT data, token by token.
+    /// The production (fast r50k) pretokenizer against the GPT-2 reference
+    /// regex on ~5 MB of OWT, token by token.
     #[test]
     fn test_pretokenizer_matches_regex_owt() {
-        const SIZE: usize = 5_000_000;
-        let input = load_owt(SIZE);
-        eprintln!(
-            "Testing pretokenizer vs regex on {:.1} MB of OWT",
-            input.len() as f64 / 1e6
-        );
-
-        let re = fancy_regex::Regex::new(GPT2_REGEX).unwrap();
+        let input = load_owt_prefix(5_000_000);
         let text = std::str::from_utf8(&input).unwrap();
-
-        let mut fast_iter = pretokenize_as_iter(&input);
-        let mut re_iter = re.find_iter(text);
-        let mut token_idx: usize = 0;
-        let mut recent: Vec<(String, String)> = Vec::new();
-
-        loop {
-            match (fast_iter.next(), re_iter.next()) {
-                (Some(fast_tok), Some(re_match)) => {
-                    let re_match = re_match.expect("regex match error");
-                    let fast_str = String::from_utf8_lossy(fast_tok.0);
-                    let re_str = &text[re_match.start()..re_match.end()];
-                    recent.push((fast_str.to_string(), re_str.to_string()));
-                    if recent.len() > 10 {
-                        recent.remove(0);
-                    }
-                    assert_eq!(
-                        fast_str, re_str,
-                        "Mismatch at token {token_idx} (byte ~{}).\n  fast:  {:?}\n  regex: {:?}\n  recent tokens: {:?}",
-                        re_match.start(), fast_str, re_str, recent
-                    );
-                }
-                (None, None) => break,
-                (Some(fast_tok), None) => {
-                    panic!(
-                        "Fast pretokenizer produced extra token at index {token_idx}: {:?}\n  recent: {:?}",
-                        String::from_utf8_lossy(fast_tok.0),
-                        recent
-                    );
-                }
-                (None, Some(re_match)) => {
-                    let re_match = re_match.expect("regex match error");
-                    panic!(
-                        "Regex produced extra token at index {token_idx}: {:?}\n  recent: {:?}",
-                        &text[re_match.start()..re_match.end()],
-                        recent
-                    );
-                }
-            }
-            token_idx += 1;
-        }
-        eprintln!("All {token_idx} tokens match.");
-    }
-
-    #[test]
-    fn test_pretokenizer_ts() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let file_bytes = fs::read(data_dir.join("TinyStoriesV2-GPT4-train.txt")).unwrap();
-
-        let pretokenized_counts = pretokenize_as_iter(&file_bytes).counts();
-        eprintln!("Pretokenized {} unique tokens", pretokenized_counts.len());
-
-        let mut sorted_counts: Vec<_> = pretokenized_counts.iter().collect();
-        sorted_counts.sort_by_key(|&(_, &v)| v);
-        sorted_counts.reverse();
-        for &(&token, &count) in sorted_counts.iter().take(100) {
-            eprintln!("{1}: {0}", String::from_utf8_lossy(&token), count);
-        }
-    }
-
-    #[test]
-    fn test_pretokenizer_owt_length() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let file_bytes = fs::read(data_dir.join("owt_train.txt")).unwrap();
-
-        let pretokens_count = pretokenize_as_iter(&file_bytes).count();
-        eprintln!("Pretokenized {pretokens_count} tokens");
+        assert_matches_regex(GPT2_REGEX, text, pretokenize_as_iter(&input));
     }
 }
 
@@ -1020,9 +772,9 @@ mod span_source_tests {
             let b: &[u8] = &buf;
             check_all_mask_schemes(b);
             check_source(
-                SpanIter(PretokenizerIter::new(b)),
-                PretokenizerIter::new(b),
-                "state_machine",
+                SpanIter(FastR50kPretokenizer::new(b)),
+                FastR50kPretokenizer::new(b),
+                "span_iter",
             );
             for pt in [
                 PretokenizerType::GPT2,

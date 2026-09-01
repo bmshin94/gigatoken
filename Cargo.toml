@@ -30,8 +30,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 flate2 = "1.1"
 zstd = "0.13"
 spm_precompiled = "0.1.4"
-simdutf = "0.7.0"
-winnow = { version = "1", features = ["simd"] }
 parquet = { version = "59.1.0", default-features = false, features = [
     "arrow",
     "snap",
@@ -82,7 +80,6 @@ strip = "none"
 criterion = "0.8"
 fancy-regex = "0.18.0"
 rand = "0.10"
-simdutf = "0.7.0"
 tempfile = "3.27.0"
 
 
@@ -111,18 +108,9 @@ harness = false
 test = false
 
 [[bench]]
-name = "pretokenize_profile"
-harness = false
-test = false
-
-[[bench]]
 name = "pretokenize_profile_all"
 harness = false
 test = false
-
-[[bench]]
-name = "simdutf_transcode"
-harness = false
 
 [lints.rust]
 unused = "allow"

@@ -32,7 +32,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
-    let mut state = gigatoken_rs::EncodeState::new();
+    let mut state = gigatoken_rs::EncodeState::default();
     for pass in 1..=passes {
         let mut total_tokens: usize = 0;
         let start = Instant::now();

@@ -1,30 +1,18 @@
-//! Minimal HuggingFace Hub file download into the standard HF cache.
-//!
-//! Rust port of the former pure-Python `gigatoken._load.hub`: same endpoint
-//! and URL layout as `huggingface_hub.hf_hub_download`, same token discovery
-//! (HF_TOKEN env var, then the token file written by `hf auth login`), and
-//! the same cache directory resolution, without requiring huggingface_hub,
-//! tokenizers, or transformers. Files already present in the standard HF
-//! cache are served with a pure-filesystem lookup (no network); on a miss the
-//! file is downloaded straight into the shared cache — under the commit hash
-//! the Hub reports via `x-repo-commit`, with the branch ref recorded — so
-//! huggingface_hub and later lookups serve it from the same place.
+//! Minimal HuggingFace Hub file download into the standard HF cache: same
+//! URL layout, token discovery and cache layout as `huggingface_hub`, so
+//! cached files are shared both ways. Cached files are served with a pure
+//! filesystem lookup; misses download under the commit the Hub reports.
 
 use eyre::{Context, Result, bail};
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-/// Filename suffixes of local tokenizer files (tokenizer.json contents and
-/// raw sentencepiece models — the formats the hf loader reads from disk).
-/// A name ending in one of these is never treated as a Hub repo id, so a
-/// mistyped local path fails fast instead of hitting the network. Keep in
-/// sync with `gigatoken._load.hub.TOKENIZER_FILE_SUFFIXES`.
+/// A name ending in one of these is a local tokenizer file, never a Hub
+/// repo id. Keep in sync with `gigatoken._load.hub.TOKENIZER_FILE_SUFFIXES`.
 pub const TOKENIZER_FILE_SUFFIXES: &[&str] = &[".json", ".model"];
 
-/// Whether `name` is shaped like a HuggingFace Hub repo id: `org/name`, or a
-/// bare legacy repo name like `gpt2`. At most one slash, and not something
-/// that is obviously a filesystem path to a local tokenizer file.
+/// Whether `name` is shaped like a Hub repo id (`org/name` or bare `gpt2`).
 pub fn looks_like_repo_id(name: &str) -> bool {
     let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
     let part_ok = |part: &str, first_alnum: bool| {
@@ -160,9 +148,8 @@ pub fn cached_hub_file_in(repo_type: RepoType, repo_id: &str, filename: &str, re
     path.is_file().then_some(path)
 }
 
-/// Download failure with a definite HTTP cause, kept as a typed error so the
-/// Python bindings can raise the matching exception (FileNotFoundError for
-/// 404, PermissionError for 401/403).
+/// Download failure with a definite HTTP cause; the Python bindings map
+/// these to FileNotFoundError / PermissionError.
 #[derive(Debug)]
 pub enum FetchError {
     /// 404: no such repo, revision, or file.
@@ -222,9 +209,8 @@ fn download_into_cache(repo_type: RepoType, repo_id: &str, filename: &str, revis
     );
     let token = get_hf_token();
 
-    // Redirects are followed by hand: resolve/ URLs answer with the
-    // `x-repo-commit` header and a redirect to a CDN for LFS files, and the
-    // Authorization header must not travel to the other host.
+    // Redirects are followed by hand so the Authorization header never
+    // travels to the CDN host.
     let agent = ureq::Agent::config_builder()
         .max_redirects(0)
         .http_status_as_error(false)
@@ -250,8 +236,6 @@ fn download_into_cache(repo_type: RepoType, repo_id: &str, filename: &str, revis
         let location = header(&response, "location")
             .ok_or_else(|| eyre::eyre!("{url}: redirect with no Location header"))?;
         let next_url = absolutize(&location, &url);
-        // No Authorization here: the redirect target is a presigned CDN URL
-        // on another host (requests/huggingface_hub drop the header too).
         response = agent
             .get(&next_url)
             .header("User-Agent", "gigatoken")
@@ -260,16 +244,14 @@ fn download_into_cache(repo_type: RepoType, repo_id: &str, filename: &str, revis
     }
     ensure_status(&url, response.status().as_u16(), token.is_some())?;
 
-    // Snapshot directory: the commit the Hub reported, falling back to the
-    // requested revision (e.g. a plain file server behind HF_ENDPOINT).
+    // A plain file server behind HF_ENDPOINT reports no commit.
     let commit = commit.unwrap_or_else(|| revision.to_owned());
     let repo_dir = repo_cache_dir(repo_type, repo_id);
     let target = repo_dir.join("snapshots").join(&commit).join(filename);
     let dir = target.parent().expect("snapshot file has a parent");
     std::fs::create_dir_all(dir).wrap_err_with(|| format!("creating {}", dir.display()))?;
 
-    // Stream to a sibling temp file, then rename: concurrent downloaders
-    // race benignly and readers never observe a partial file.
+    // Temp file + rename so readers never observe a partial file.
     let tmp = dir.join(format!(".{}.{}.tmp", target.file_name().unwrap().to_string_lossy(), std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = std::fs::File::create(&tmp)?;

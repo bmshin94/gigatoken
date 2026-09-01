@@ -2,16 +2,12 @@
 //! encode_files or train_bpe argument into loaded, format-tagged file
 //! contents.
 
-use crate::input::Resource;
 use crate::input::file_source::{DocFormat, LoadedFile, detect_default_format, load_file};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use std::path::PathBuf;
 
-/// Base class for file sources. Not directly constructible from Python —
-/// use `TextFileSource` or `JsonlFileSource`, which pin down the document
-/// format and its parameters. Compression (.gz/.zst) is always detected
-/// from the file extension, independent of the source type.
+/// Base class for file sources; constructed through the subclasses.
 #[pyclass(subclass, from_py_object)]
 #[derive(Clone)]
 pub(crate) struct FileSource {
@@ -122,14 +118,8 @@ impl ParquetFileSource {
     }
 }
 
-/// In-memory bytes for encode_batch, the buffer analog of TextFileSource:
-/// with `separator` (str or bytes), each buffer's documents are the pieces
-/// between separator occurrences (the separator itself belongs to no
-/// document, and empty pieces are skipped); without one, each buffer is a
-/// single document. The buffers are borrowed, not copied, and split during
-/// the (parallel) encode itself — handing a whole corpus over as a few
-/// buffers plus a separator is much faster than pre-splitting it into
-/// per-document Python objects.
+/// In-memory bytes for encode_batch, the buffer analog of TextFileSource.
+/// The buffers are borrowed, not copied, and split during the encode.
 #[pyclass(frozen)]
 pub(crate) struct BytesSource {
     pub(crate) buffers: Vec<PyBackedBytes>,
@@ -174,10 +164,8 @@ impl BytesSource {
     }
 }
 
-/// Resolve an encode_files argument: a FileSource (TextFileSource /
-/// JsonlFileSource), a single path, or a list of paths. Bare paths get a
-/// default format from the first path's extension — all inputs in a batch
-/// are assumed to be of the same type.
+/// Resolve an encode_files argument: a FileSource, a path, or a list of
+/// paths (format detected from the first path's extension).
 pub(crate) fn resolve_files_source(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<PathBuf>, DocFormat)> {
     if let Ok(fs) = obj.extract::<FileSource>() {
         return Ok((fs.paths, fs.format));
@@ -199,38 +187,33 @@ pub(crate) fn resolve_files_source(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<Path
     )))
 }
 
-/// Shared scaffold of the encode_files pymethods: resolve the source
-/// argument, load the files with the GIL released, hand their contents and
-/// document format to `encode` (still detached), and return the ragged
-/// result as an awkward Array. The per-backend encoding lives in
-/// `batch::encode_files_docs` / `batch::sp_encode_files_docs`.
+/// Shared scaffold of the encode_files pymethods: resolve the source, load
+/// the files with the GIL released, run `encode` (still detached), and
+/// return the ragged result as an awkward Array.
 pub(crate) fn encode_files_ragged<'py>(
     py: Python<'py>,
     source: &Bound<'py, PyAny>,
     parallel: bool,
-    encode: impl FnOnce(&[&[u8]], &DocFormat) -> (Vec<u32>, Vec<i64>) + Send,
+    encode: impl FnOnce(&[&[u8]], &DocFormat) -> PyResult<(Vec<u32>, Vec<i64>)> + Send,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (paths, format) = resolve_files_source(source)?;
     let (flat, counts) = py.detach(|| -> PyResult<_> {
-        // Parquet rows can't be split out of the raw file bytes, so they are
-        // materialized as owned documents here and encoded through the
-        // whole-document path (each buffer one document).
+        // Parquet rows are materialized as owned documents and encoded
+        // through the whole-document path.
         if let DocFormat::Parquet { column } = &format {
             let docs = load_parquet_docs(&paths, column, parallel)?;
             let bytes: Vec<&[u8]> = docs.iter().map(|d| d.as_slice()).collect();
-            return Ok(encode(&bytes, &DocFormat::Text { separator: None }));
+            return encode(&bytes, &DocFormat::Text { separator: None });
         }
         let files = load_files(&paths, parallel)?;
         let bytes: Vec<&[u8]> = files.iter().map(|f| f.as_bytes()).collect();
-        Ok(encode(&bytes, &format))
+        encode(&bytes, &format)
     })?;
     super::bridge::ragged_to_python(py, flat, counts)
 }
 
-/// Load `column` of every parquet file as one owned document per row, files
-/// in argument order, rows in row order. Parallel across files and row
-/// groups with rayon, or fully on the calling thread when `parallel` is
-/// false (the sequential encode paths must never touch the rayon pool).
+/// `column` of every parquet file as one owned document per row, files in
+/// argument order. Serial on the calling thread when `parallel` is false.
 fn load_parquet_docs(
     paths: &[PathBuf],
     column: &str,
@@ -254,10 +237,7 @@ fn load_parquet_docs(
     Ok(per_file.into_iter().flatten().collect())
 }
 
-/// Load all files: mmap when stored uncompressed, decompress .gz/.zst into
-/// memory otherwise (parallel chunking needs random access). In parallel
-/// with rayon, or serially on the calling thread when `parallel` is false
-/// (the sequential encode paths must never touch the rayon pool).
+/// Load all files (see `load_file`), serially when `parallel` is false.
 pub(crate) fn load_files(paths: &[PathBuf], parallel: bool) -> PyResult<Vec<LoadedFile>> {
     use rayon::prelude::*;
     let load = |p: &PathBuf| {

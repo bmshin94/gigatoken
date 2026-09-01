@@ -5,9 +5,8 @@
 //! `\p{N}` digit tokens. See `o200k_family` (`CONTRACTIONS = false`,
 //! `DIGITS3 = false`).
 
-use super::mask::{MaskScheme, MaskState};
+use super::mask::MaskScheme;
 use super::o200k_family;
-use crate::pretokenize::Pretoken;
 
 pub(crate) struct NemotronScheme;
 
@@ -31,85 +30,35 @@ impl MaskScheme for NemotronScheme {
     }
 }
 
-/// With SIMD support (aarch64 NEON, or x86_64 AVX-512/AVX2 detected at
-/// runtime), iteration runs the shared o200k-family mask scanner (see
-/// `o200k_family::batch_masks`); elsewhere every token takes the scalar
-/// `advance_pos`.
-pub struct FastNemotronPretokenizer<'a> {
-    bytes: &'a [u8],
-    state: MaskState,
-}
-
-impl<'a> FastNemotronPretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, state: MaskState::new(pos) }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastNemotronPretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<NemotronScheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastNemotronPretokenizer, NemotronScheme);
+super::define_mask_pretokenizer!(FastNemotronPretokenizer, NemotronScheme);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pretokenize::fast::test_support::*;
 
     /// The Nemotron pattern verbatim — no possessive quantifiers, so it
     /// runs directly under fancy-regex.
     const NEMOTRON_REF_REGEX: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    fn regex_tokens(s: &str) -> Vec<String> {
-        let re = fancy_regex::Regex::new(NEMOTRON_REF_REGEX).unwrap();
-        re.find_iter(s)
-            .map(|m| m.unwrap().as_str().to_string())
-            .collect()
+    fn fast(s: &str) -> Vec<String> {
+        fast_tokens(FastNemotronPretokenizer::new(s.as_bytes()))
     }
 
-    fn fast_tokens(s: &str) -> Vec<String> {
-        FastNemotronPretokenizer::new(s.as_bytes())
-            .map(|t| String::from_utf8_lossy(t.0).into_owned())
-            .collect()
+    fn reference(s: &str) -> Vec<String> {
+        regex_tokens(NEMOTRON_REF_REGEX, s)
     }
 
-    /// The o200k small-case list applies verbatim (contraction cases just
+    /// The o200k-family case list applies verbatim (contraction cases just
     /// tokenize differently, which the reference regex reflects).
     #[test]
     fn nemotron_small_cases() {
-        for case in crate::pretokenize::fast::o200k::tests::SMALL_CASES {
-            assert_eq!(
-                fast_tokens(case),
-                regex_tokens(case),
-                "Mismatch on case {case:?}"
-            );
-        }
+        assert_cases(O200K_FAMILY_CASES, fast, reference);
     }
 
-    /// Random codepoint soup drawn from classes the scheme distinguishes,
-    /// compared against the reference regex.
+    /// Random codepoint soup drawn from classes the scheme distinguishes.
     #[test]
     fn nemotron_matches_regex_random() {
-        use rand::prelude::*;
         let pools: &[&[char]] = &[
             &['a', 'z', 'é', 'ß', 'ж', 'ا', '한', '日'],      // lower/caseless
             &['A', 'Z', 'É', 'Ж', 'Ǆ', 'ǅ'],                  // upper/title
@@ -119,20 +68,6 @@ mod tests {
             &['.', ',', '!', '$', '\'', '«', '¡', '€', '☃', '/'], // punct/symbols
             &['\u{0}', '\u{ad}', '\u{200b}', '\u{e0001}'],    // other (C*)
         ];
-        let mut rng = StdRng::seed_from_u64(0x93E3_5EEE);
-        for round in 0..3000 {
-            let len = rng.random_range(1..40);
-            let s: String = (0..len)
-                .map(|_| {
-                    let pool = pools.choose(&mut rng).unwrap();
-                    *pool.choose(&mut rng).unwrap()
-                })
-                .collect();
-            assert_eq!(
-                fast_tokens(&s),
-                regex_tokens(&s),
-                "Mismatch on round {round}, case {s:?}"
-            );
-        }
+        assert_random_soup(pools, 0x93E3_5EEE, 3000, fast, reference);
     }
 }

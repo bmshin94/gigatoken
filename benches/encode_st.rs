@@ -75,7 +75,7 @@ fn main() {
                 Ok(text) => text,
                 Err(e) => std::str::from_utf8(&buf[..e.valid_up_to()]).unwrap(),
             };
-            let mut state = gigatoken_rs::EncodeState::new();
+            let mut state = gigatoken_rs::EncodeState::default();
             for pass in 0..passes {
                 out.clear();
                 let start = Instant::now();
